@@ -575,17 +575,20 @@ def get_network_info() -> dict:
         if os.name == "nt":
             import subprocess
             CREATE_NO_WINDOW = 0x08000000
-            # Check WiFi
+            # Check if WiFi is actually connected
             r = subprocess.run(
                 ["netsh","wlan","show","interfaces"],
                 capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=3
             )
-            if "State" in r.stdout and "connected" in r.stdout.lower():
+            wifi_connected = "State" in r.stdout and "connected" in r.stdout.lower() and "disconnected" not in r.stdout.lower()
+            if wifi_connected:
                 info["connection_type"] = "Wi-Fi"
                 for line in r.stdout.splitlines():
                     if "SSID" in line and "BSSID" not in line:
-                        info["wifi_name"] = line.split(":",1)[-1].strip()
-                        break
+                        ssid = line.split(":",1)[-1].strip()
+                        if ssid:
+                            info["wifi_name"] = ssid
+                            break
             else:
                 info["connection_type"] = "Ethernet"
 
@@ -679,29 +682,50 @@ def get_audio_devices() -> dict:
     return devices
 
 def play_sound(file_path: str, device_id: int = -1) -> bool:
-    """Play a sound file through a specific audio device."""
+    """Play a sound file through the PC audio output using pygame."""
     try:
-        import subprocess
-        CREATE_NO_WINDOW = 0x08000000
-        # Try sounddevice + soundfile for device routing
+        print(f"[SOUND DEBUG] path='{file_path}' exists={os.path.exists(file_path)} device={device_id}")
+
+        # Try sounddevice for specific device routing
+        if device_id >= 0:
+            try:
+                import sounddevice as sd, soundfile as sf
+                data, samplerate = sf.read(file_path)
+                sd.play(data, samplerate, device=device_id)
+                sd.wait()
+                print(f"[SOUND] Played via sounddevice on device {device_id}")
+                return True
+            except ImportError:
+                print(f"[SOUND DEBUG] sounddevice not available, trying pygame")
+            except Exception as e:
+                print(f"[SOUND DEBUG] sounddevice error: {e}")
+
+        # pygame
         try:
-            import sounddevice as sd
-            import soundfile as sf
-            data, samplerate = sf.read(file_path)
-            sd.play(data, samplerate, device=device_id if device_id >= 0 else None)
-            sd.wait()
-            print(f"[SOUND] Played: {file_path} on device {device_id}")
+            import pygame
+            print(f"[SOUND DEBUG] pygame available, init={pygame.mixer.get_init()}")
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+                print(f"[SOUND DEBUG] pygame mixer initialized: {pygame.mixer.get_init()}")
+            pygame.mixer.music.load(file_path)
+            pygame.mixer.music.play()
+            print(f"[SOUND] Playing via pygame — busy={pygame.mixer.music.get_busy()}")
             return True
         except ImportError:
-            pass
-        # Fallback — PowerShell for default device
-        ps = f"(New-Object Media.SoundPlayer '{file_path}').PlaySync()"
-        subprocess.run(
-            ["powershell", "-command", ps],
-            creationflags=CREATE_NO_WINDOW, timeout=30
-        )
-        print(f"[SOUND] Played (PS): {file_path}")
-        return True
+            print(f"[SOUND DEBUG] pygame not installed")
+        except Exception as e:
+            print(f"[SOUND DEBUG] pygame error: {e}")
+
+        # Fallback WAV
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".wav":
+            import winsound
+            winsound.PlaySound(file_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            print(f"[SOUND] Playing via winsound")
+            return True
+
+        print(f"[SOUND] No method worked for {file_path}")
+        return False
     except Exception as e:
         print(f"[SOUND ERROR] {e}")
         return False
@@ -724,6 +748,8 @@ def receive_upload(file_name: str, data_b64: str, dest_folder: str) -> dict:
     except Exception as e:
         print(f"[UPLOAD ERROR] {e}")
         return {"success": False, "error": str(e)}
+
+def send_media_key(action: str) -> bool:
     """Send a media key press using Windows API."""
     if os.name != "nt":
         return False
@@ -1252,6 +1278,8 @@ async def send_network_loop(ws):
             }))
         except Exception as e:
             print(f"[NETWORK LOOP ERROR] {e}"); break
+
+async def handle_command(cmd, ws):
     t      = cmd.get("type")
     cmd_id = cmd.get("command_id")
     if not t: return
@@ -1631,6 +1659,16 @@ async def connect():
                     startup_queue_started = True
                     threading.Thread(target=execute_startup_queue, daemon=True).start()
 
+                # Fetch network info once on connect so mobile can show WoL warning
+                async def _send_initial_network():
+                    await asyncio.sleep(2)
+                    try:
+                        loop = asyncio.get_event_loop()
+                        info = await loop.run_in_executor(None, get_network_info)
+                        await ws.send(json.dumps({"type":"network_info","device_id":DEVICE_ID,**info}))
+                    except: pass
+                asyncio.create_task(_send_initial_network())
+
                 heartbeat_task = asyncio.create_task(send_heartbeat(ws))
                 stats_task     = asyncio.create_task(send_stats_loop(ws))
                 volume_task    = asyncio.create_task(send_volume_loop(ws))
@@ -1730,17 +1768,17 @@ def handle_soundboard_picker_request(request_id: str, file_filter: list):
         "name": os.path.basename(result) if result else None,
         "device_id": DEVICE_ID,
     })
+
+def handle_file_picker_request(request_id: str):
     """Opens a Windows file dialog and sends the selected path back via WebSocket."""
     try:
         root = tk.Tk()
         root.withdraw()
-        # Prevent maximize — maximized tkinter windows can't be dragged by title bar
         root.resizable(True, True)
         root.attributes("-topmost", True)
         root.lift()
         root.focus_force()
         root.update()
-        # Remove topmost after 200ms so user can switch windows behind it
         root.after(200, lambda: root.attributes("-topmost", False))
         path = filedialog.askopenfilename(
             title="Select File for Custom Action — PCLink",
@@ -1756,7 +1794,6 @@ def handle_soundboard_picker_request(request_id: str, file_filter: list):
     except Exception as e:
         print(f"[FILE PICKER ERROR] {e}")
         result = None
-
     threadsafe_send({
         "type":       "file_picker_result",
         "request_id": request_id,
@@ -2083,14 +2120,23 @@ if __name__ == "__main__":
         if flags["tray_unpair"]:
             flags["tray_unpair"] = False
             handle_tray_unpair()
-        fp = flags.get("file_picker_request")
-        if fp:
-            flags["file_picker_request"] = None
-            handle_file_picker_request(fp["request_id"])
         sp = flags.get("soundboard_picker_request")
         if sp:
             flags["soundboard_picker_request"] = None
-            handle_soundboard_picker_request(sp["request_id"], sp.get("filter",[]))
+            flags["file_picker_request"] = None  # kill any stale file picker
+            flags["_picker_cooldown"] = time.time() + 3.0  # 3s cooldown
+            threading.Thread(
+                target=handle_soundboard_picker_request,
+                args=(sp["request_id"], sp.get("filter",[])),
+                daemon=True
+            ).start()
+        fp = flags.get("file_picker_request")
+        cooldown = flags.get("_picker_cooldown", 0)
+        if fp and time.time() > cooldown:
+            flags["file_picker_request"] = None
+            handle_file_picker_request(fp["request_id"])
+        elif fp and time.time() <= cooldown:
+            flags["file_picker_request"] = None  # discard stale picker during cooldown
         update_ver = flags.get("update_available")
         if update_ver:
             flags["update_available"] = None
