@@ -681,9 +681,116 @@ def get_audio_devices() -> dict:
         except: pass
     return devices
 
-def play_sound(file_path: str, device_id: int = -1) -> bool:
+import queue as _queue
+_sound_queue = _queue.Queue()
+_pygame_ready = False
+_active_sounds = []  # track playing Sound objects for stop-all
+
+def _pygame_worker():
+    """Dedicated thread that owns the pygame mixer — thread-safe."""
+    global _pygame_ready
+    try:
+        import pygame
+        pygame.mixer.pre_init(44100, -16, 2, 512)
+        pygame.mixer.init()
+        pygame.mixer.set_num_channels(32)  # support many simultaneous sounds
+        _pygame_ready = True
+        print("[SOUND] pygame mixer ready (32 channels)")
+    except Exception as e:
+        print(f"[SOUND] pygame init failed: {e}")
+        _pygame_ready = False
+    while True:
+        try:
+            cmd, *args = _sound_queue.get(timeout=1)
+            if cmd == "play":
+                file_path = args[0]
+                try:
+                    import pygame
+                    snd = pygame.mixer.Sound(file_path)
+                    _active_sounds.append(snd)
+                    # Clean up finished sounds
+                    _active_sounds[:] = [s for s in _active_sounds if s.get_num_channels() > 0]
+                    _active_sounds.append(snd)
+                    snd.play()
+                    print(f"[SOUND] Playing (overlap ok): {file_path}")
+                except Exception as e:
+                    print(f"[SOUND] Play error: {e}")
+            elif cmd == "stop":
+                try:
+                    import pygame
+                    pygame.mixer.stop()
+                    _active_sounds.clear()
+                    print("[SOUND] Stopped all")
+                except Exception as e:
+                    print(f"[SOUND] Stop error: {e}")
+        except _queue.Empty:
+            continue
+        except Exception as e:
+            print(f"[SOUND WORKER] {e}")
+
+def init_pygame_mixer():
+    """Start the dedicated pygame worker thread."""
+    t = threading.Thread(target=_pygame_worker, daemon=True)
+    t.start()
+
+def play_sound(file_path: str, audio_device_id: int = -1) -> bool:
+    """Queue a sound to play — supports overlapping simultaneous playback."""
+    try:
+        file_path = file_path.replace("/", "\\")
+        print(f"[SOUND DEBUG] path='{file_path}' exists={os.path.exists(file_path)} device={audio_device_id}")
+
+        if not os.path.exists(file_path):
+            print(f"[SOUND] File not found: {file_path}")
+            return False
+
+        # Try sounddevice for specific device routing
+        if audio_device_id >= 0:
+            try:
+                import sounddevice as sd, soundfile as sf
+                data, samplerate = sf.read(file_path)
+                sd.play(data, samplerate, device=audio_device_id)
+                print(f"[SOUND] Playing via sounddevice on device {audio_device_id}")
+                return True
+            except ImportError:
+                pass
+            except Exception as e:
+                print(f"[SOUND DEBUG] sounddevice error: {e}")
+
+        # Queue to dedicated pygame thread
+        if _pygame_ready:
+            _sound_queue.put(("play", file_path))
+            return True
+
+        # Fallback: WAV via winsound
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".wav":
+            import winsound
+            winsound.PlaySound(file_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            print(f"[SOUND] Playing via winsound")
+            return True
+
+        print(f"[SOUND] pygame not ready")
+        return False
+    except Exception as e:
+        print(f"[SOUND ERROR] {e}")
+        return False
+
+def stop_all_sounds() -> bool:
+    """Stop all currently playing sounds."""
+    try:
+        if _pygame_ready:
+            _sound_queue.put(("stop",))
+            return True
+        import winsound
+        winsound.PlaySound(None, winsound.SND_PURGE)
+        return True
+    except Exception as e:
+        print(f"[STOP ERROR] {e}")
+        return False
     """Play a sound file through the PC audio output using pygame."""
     try:
+        # Normalize path separators — tkinter returns forward slashes on Windows
+        file_path = file_path.replace("/", "\\")
         print(f"[SOUND DEBUG] path='{file_path}' exists={os.path.exists(file_path)} device={device_id}")
 
         # Try sounddevice for specific device routing
@@ -1546,13 +1653,14 @@ async def handle_command(cmd, ws):
             return
         elif t == "play_sound":
             file_path = cmd.get("path","")
-            device_id = cmd.get("device_id", -1)
+            audio_device_id = cmd.get("audio_device_id", -1)
             if file_path:
                 loop = asyncio.get_event_loop()
-                ok = await loop.run_in_executor(None, lambda: play_sound(file_path, device_id))
-                if not ok: status = "failed"
+                await loop.run_in_executor(None, lambda: play_sound(file_path, audio_device_id))
             else:
                 status = "failed"
+        elif t == "stop_sounds":
+            stop_all_sounds()
         elif t == "upload_file":
             file_name   = cmd.get("name","upload")
             data_b64    = cmd.get("data","")
@@ -1757,7 +1865,7 @@ def handle_soundboard_picker_request(request_id: str, file_filter: list):
             parent=root,
         )
         root.destroy()
-        result = path if path else None
+        result = path.replace("/", "\\") if path else None
         print(f"[SOUNDBOARD PICKER] Selected: {result}")
     except Exception as e:
         print(f"[SOUNDBOARD PICKER ERROR] {e}"); result = None
@@ -2078,6 +2186,9 @@ if __name__ == "__main__":
     print(f"[AGENT] GPU:       {GPU_METHOD or 'unavailable'}")
 
     setup_autostart()
+
+    # Pre-initialize pygame for soundboard (eliminates first-play delay)
+    threading.Thread(target=init_pygame_mixer, daemon=True).start()
 
     # Check for updates in background
     threading.Thread(target=check_for_updates, daemon=True).start()
