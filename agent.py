@@ -312,6 +312,7 @@ flags = {
     "file_picker_request":      None,
     "soundboard_picker_request":None,
     "volume_subscribed":        False,
+    "network_subscribed":       False,
     "update_available":         None,
 }
 
@@ -535,24 +536,28 @@ def get_now_playing() -> dict | None:
     if os.name != "nt":
         return None
     try:
-        import asyncio
-        # Run async winsdk code in a fresh event loop (called from executor thread)
-        loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(_get_now_playing_async())
-        loop.close()
+        import asyncio as _asyncio
+        import concurrent.futures
+        def _run_in_thread():
+            loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(_get_now_playing_async())
+            finally:
+                loop.close()
+                _asyncio.set_event_loop(None)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            result = ex.submit(_run_in_thread).result(timeout=6)
 
         if result and result["title"]:
-            # Only send album art when track changes to save bandwidth
             if (result["title"] != _last_known_track.get("title") or
                 result["artist"] != _last_known_track.get("artist")):
                 track = result
             else:
-                # Same track — omit album art to save bandwidth
                 track = {**result, "album_art": None, "art_unchanged": True}
             _last_known_track = result
             print(f"[MEDIA] {result['title']} — {result['artist']} ({result['status']})")
             return track
-
         if _last_known_track["title"]:
             return {**_last_known_track, "status": "Paused", "is_last_known": True, "album_art": None}
     except Exception as e:
@@ -560,41 +565,37 @@ def get_now_playing() -> dict | None:
     return None
 
 def get_network_info() -> dict:
-    """Get network adapter stats — current speeds and connection info."""
-    info = { "wifi_name": None, "interface": None, "bytes_sent": 0, "bytes_recv": 0,
-             "upload_mbps": 0.0, "download_mbps": 0.0, "ip": None }
+    """Get network adapter stats — connection type and current speeds."""
+    info = { "wifi_name": None, "connection_type": None,
+             "upload_mbps": 0.0, "download_mbps": 0.0 }
     if not PSUTIL_AVAILABLE:
         return info
     try:
-        # Get WiFi SSID on Windows
+        # Detect connection type and WiFi name
         if os.name == "nt":
             import subprocess
             CREATE_NO_WINDOW = 0x08000000
+            # Check WiFi
             r = subprocess.run(
                 ["netsh","wlan","show","interfaces"],
-                capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
+                capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=3
             )
-            for line in r.stdout.splitlines():
-                if "SSID" in line and "BSSID" not in line:
-                    info["wifi_name"] = line.split(":",1)[-1].strip()
-                    break
+            if "State" in r.stdout and "connected" in r.stdout.lower():
+                info["connection_type"] = "Wi-Fi"
+                for line in r.stdout.splitlines():
+                    if "SSID" in line and "BSSID" not in line:
+                        info["wifi_name"] = line.split(":",1)[-1].strip()
+                        break
+            else:
+                info["connection_type"] = "Ethernet"
 
-        # Get IP
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(("8.8.8.8", 80))
-            info["ip"] = s.getsockname()[0]
-        finally:
-            s.close()
-
-        # Sample network bytes over 1 second for speed
+        # Sample network bytes over 0.5 seconds for speed
         c1 = psutil.net_io_counters()
-        time.sleep(1)
+        time.sleep(0.5)
         c2 = psutil.net_io_counters()
-        info["upload_mbps"]   = round((c2.bytes_sent - c1.bytes_sent) * 8 / 1_000_000, 2)
-        info["download_mbps"] = round((c2.bytes_recv - c1.bytes_recv) * 8 / 1_000_000, 2)
-        info["bytes_sent"]    = c2.bytes_sent
-        info["bytes_recv"]    = c2.bytes_recv
+        elapsed = 0.5
+        info["upload_mbps"]   = round((c2.bytes_sent - c1.bytes_sent) * 8 / 1_000_000 / elapsed, 2)
+        info["download_mbps"] = round((c2.bytes_recv - c1.bytes_recv) * 8 / 1_000_000 / elapsed, 2)
     except Exception as e:
         print(f"[NETWORK ERROR] {e}")
     return info
@@ -1237,7 +1238,20 @@ async def send_volume_loop(ws):
         except Exception as e:
             print("[VOLUME LOOP ERROR]", e); break
 
-async def handle_command(cmd, ws):
+async def send_network_loop(ws):
+    """Poll network stats every second when subscribed."""
+    while True:
+        await asyncio.sleep(1)
+        if not flags.get("network_subscribed"):
+            continue
+        try:
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(None, get_network_info)
+            await ws.send(json.dumps({
+                "type": "network_info", "device_id": DEVICE_ID, **info
+            }))
+        except Exception as e:
+            print(f"[NETWORK LOOP ERROR] {e}"); break
     t      = cmd.get("type")
     cmd_id = cmd.get("command_id")
     if not t: return
@@ -1482,6 +1496,12 @@ async def handle_command(cmd, ws):
                 "type":"network_info","device_id":DEVICE_ID,**info
             }))
             return
+        elif t == "network_subscribe":
+            flags["network_subscribed"] = True
+            return
+        elif t == "network_unsubscribe":
+            flags["network_subscribed"] = False
+            return
         elif t == "run_speedtest":
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, run_speedtest)
@@ -1614,6 +1634,7 @@ async def connect():
                 heartbeat_task = asyncio.create_task(send_heartbeat(ws))
                 stats_task     = asyncio.create_task(send_stats_loop(ws))
                 volume_task    = asyncio.create_task(send_volume_loop(ws))
+                network_task   = asyncio.create_task(send_network_loop(ws))
 
                 while True:
                     try:
@@ -1622,7 +1643,8 @@ async def connect():
                         await handle_command(data, ws)
                     except websockets.ConnectionClosed:
                         print("[DISCONNECTED] reconnecting...")
-                        heartbeat_task.cancel(); stats_task.cancel(); volume_task.cancel(); break
+                        heartbeat_task.cancel(); stats_task.cancel()
+                        volume_task.cancel(); network_task.cancel(); break
                     except Exception as e:
                         print("[RECV ERROR]", e)
         except Exception as e:

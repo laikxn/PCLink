@@ -504,7 +504,8 @@ async def handler(ws):
                                "media_control", "set_clipboard", "type_text",
                                "take_screenshot", "get_clipboard", "get_now_playing",
                                "get_network_info", "run_speedtest", "get_audio_devices",
-                               "play_sound", "upload_file", "browse_soundboard_files"]:
+                               "play_sound", "upload_file", "browse_soundboard_files",
+                               "network_subscribe", "network_unsubscribe"]:
                 target_id = data.get("device_id"); token = data.get("token", "")
                 if not target_id: continue
                 if target_id in device_tokens and not validate_token(target_id, token):
