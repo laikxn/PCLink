@@ -1455,7 +1455,7 @@ async def handle_command(cmd, ws):
             data = take_screenshot()
             await ws.send(json.dumps({
                 "type":"screenshot_result","device_id":DEVICE_ID,
-                "data":data,"error":None if data else "Screenshot failed",
+                "data":data,"error":None if data else "Could not capture screen. Make sure the PCLink Agent is running and try again.",
             }))
             return
         elif t == "wake_pc":
