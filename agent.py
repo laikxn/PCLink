@@ -2102,7 +2102,7 @@ def show_pair_popup():
     # Code display
     code_card = tk.Frame(root, bg=UI["surface"], padx=20, pady=12)
     code_card.pack(padx=24, fill="x")
-    tk.Label(code_card, text=f"{code[:3]}  {code[3:]}", font=_font(28, "bold", "Courier New"),
+    tk.Label(code_card, text=f"{code[:3]}  {code[3:]}", font=_font(32, "bold", "Segoe UI"),
              bg=UI["surface"], fg=UI["code_fg"]).pack()
 
     # Expiry + server info
@@ -2186,6 +2186,27 @@ def handle_tray_restart():
 # Entry point
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+    # Suppress Tcl/tkinter threading errors from background thread cleanup
+    import ctypes
+    original_excepthook = sys.excepthook
+    def _safe_excepthook(exc_type, exc_value, exc_tb):
+        msg = str(exc_value)
+        if "Tcl_AsyncDelete" in msg or "main thread is not in main loop" in msg:
+            print(f"[WARN] Suppressed tkinter threading error (harmless): {msg}")
+            return
+        original_excepthook(exc_type, exc_value, exc_tb)
+    sys.excepthook = _safe_excepthook
+
+    # Also suppress in threads
+    import threading as _threading
+    _orig_thread_excepthook = _threading.excepthook
+    def _safe_thread_excepthook(args):
+        msg = str(args.exc_value)
+        if "Tcl_AsyncDelete" in msg or "main thread is not in main loop" in msg:
+            print(f"[WARN] Suppressed tkinter thread error (harmless): {msg}")
+            return
+        _orig_thread_excepthook(args)
+    _threading.excepthook = _safe_thread_excepthook
     print(f"[AGENT] v{APP_VERSION}")
     print(f"[AGENT] Device:    {DEVICE_NAME} ({DEVICE_ID})")
     print(f"[AGENT] MAC:       {DEVICE_MAC}")
