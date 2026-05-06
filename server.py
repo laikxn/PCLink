@@ -48,7 +48,7 @@ mobile_utc_offset = 0
 
 IDLE_THRESHOLD    = 10
 OFFLINE_THRESHOLD = 25
-PAIR_CODE_TTL     = 120
+PAIR_CODE_TTL     = 300
 TOKENS_FILE       = "tokens.json"
 EVENTS_FILE       = "scheduled_events.json"
 

@@ -26,6 +26,16 @@ import sys
 import tkinter as tk
 from tkinter import font as tkfont, filedialog
 import warnings
+
+# Suppress tkinter garbage-collector threading error (harmless, happens when
+# tkinter StringVar objects are cleaned up from a non-main thread)
+import tkinter
+_orig_del = getattr(tkinter.Variable, '__del__', None)
+if _orig_del:
+    def _safe_del(self):
+        try: _orig_del(self)
+        except Exception: pass
+    tkinter.Variable.__del__ = _safe_del
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 from io import BytesIO
 
@@ -96,7 +106,7 @@ DEVICE_ID_FILE     = os.path.join(APP_DIR, "device_id.txt")
 PAIRED_FILE        = os.path.join(APP_DIR, "paired.json")
 STARTUP_QUEUE_FILE = os.path.join(APP_DIR, "startup_queue.json")
 
-PAIR_CODE_TTL      = 120
+PAIR_CODE_TTL      = 300
 STATS_INTERVAL     = 3
 AUTOSTART_REG_NAME = "PCLinkAgent"
 APP_VERSION        = "1.0.0"
