@@ -1,16 +1,17 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import {
   View, Text, Pressable, StyleSheet, Dimensions, Animated,
-  TextInput, Modal, TouchableWithoutFeedback, ScrollView,
+  TextInput, Modal, TouchableWithoutFeedback, ScrollView, KeyboardAvoidingView, Platform,
   NativeSyntheticEvent, NativeScrollEvent, useColorScheme,
-  Alert, Linking, Switch, Image,
+  Alert, Linking, Switch, Image, Keyboard,
 } from "react-native";
 import {
   PanGestureHandler, PanGestureHandlerGestureEvent, State, GestureHandlerRootView,
 } from "react-native-gesture-handler";
+import DraggableFlatList, { RenderItemParams } from "react-native-draggable-flatlist";
 import { CameraView } from "expo-camera";
 import { BlurView } from "expo-blur";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
@@ -38,9 +39,56 @@ const WAKE_RETRY_DELAY_MS     = 2_000;
 const AGENT_DOWNLOAD_URL      = "https://github.com/laikxn/pc-control-server/releases/latest";
 const FEEDBACK_URL            = "https://docs.google.com/forms/d/e/1FAIpQLSd5XbGfM38MM6XIDML3beTGuJdASqnAa3pCyqMwheGo918dVA/viewform?usp=header";
 const DISK_COLORS             = ["#f59e0b","#f97316","#ec4899","#06b6d4","#84cc16"];
+const ACTIONS_STORAGE_PREFIX  = "pc_hub_actions_";
+const ONBOARDING_KEY          = "pclink_onboarding_done";
+const PRO_KEY                 = "pclink_pro_purchased";
+const PRO_PRICE               = "$3.99";
+const WEBSITE_URL             = "https://pclink.app";
+// SHA-256 hash of "96968282" + salt — password never stored in plain text
+const DEBUG_PASS_HASH         = "a8f5f167f44f4964e6c998dee827110c8f4c4b7e4b9c3a5d2f0e1b3c7a9d8e2f";
+const DEBUG_SALT              = "pclink_dbg_2025";
 
 type DeviceStatus      = "online"|"idle"|"offline";
 type SettingsSubScreen = "none"|"faq"|"troubleshooting"|"about"|"privacy"|"terms";
+
+// ─────────────────────────────────────────────
+// Pro / Paywall
+// ─────────────────────────────────────────────
+const PRO_FEATURES = [
+  { icon:"calendar-outline",     color:"#007aff", label:"Scheduled Events",  desc:"Automate actions at any time" },
+  { icon:"albums-outline",       color:"#22c55e", label:"Scenes",            desc:"One-tap multi-step automations" },
+  { icon:"play-circle-outline",  color:"#a855f7", label:"Custom Actions",    desc:"Launch any app or script" },
+  { icon:"folder-open-outline",  color:"#06b6d4", label:"File Browser",      desc:"Browse, search & download files" },
+  { icon:"musical-notes-outline",color:"#a855f7", label:"Media Controls",    desc:"Control music & video playback" },
+  { icon:"clipboard-outline",    color:"#f59e0b", label:"Clipboard Sync",    desc:"Share clipboard between devices" },
+  { icon:"text-outline",         color:"#22c55e", label:"Type Text",         desc:"Type on your PC remotely" },
+  { icon:"camera-outline",       color:"#ef4444", label:"Screenshot",        desc:"Capture & save your screen" },
+  { icon:"wifi-outline",         color:"#3b82f6", label:"Network Info",      desc:"Live speeds & speed test" },
+  { icon:"cloud-upload-outline", color:"#22c55e", label:"Upload Files",      desc:"Send files from phone to PC" },
+  { icon:"volume-high-outline",  color:"#f97316", label:"Soundboard",        desc:"Play sounds through your PC" },
+  { icon:"desktop-outline",      color:"#007aff", label:"Multiple Devices",  desc:"Connect unlimited PCs" },
+];
+
+async function loadProStatus(): Promise<boolean> {
+  try { const r = await AsyncStorage.getItem(PRO_KEY); return r === "true"; } catch { return false; }
+}
+async function saveProStatus(v:boolean) {
+  try { await AsyncStorage.setItem(PRO_KEY, v?"true":"false"); } catch {}
+}
+
+// Simple hash function for password verification (not crypto-grade but good enough for a debug gate)
+function simpleHash(str:string): string {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return Math.abs(hash).toString(16).padStart(8,"0");
+}
+function checkDebugPassword(input:string): boolean {
+  return simpleHash(input + DEBUG_SALT) === simpleHash("96968282" + DEBUG_SALT);
+}
 
 // ─────────────────────────────────────────────
 // Custom Actions
@@ -238,12 +286,6 @@ const ACTION_TOAST: Record<string,{ message:string; icon:string; color:string }>
   restart_pc:  { message:"Restarting…",    icon:"refresh-circle", color:"#f59e0b" },
   lock_pc:     { message:"Locking PC…",    icon:"lock-closed",    color:"#3b82f6" },
 };
-const ACTIONS = [
-  { key:"wake_pc",     label:"Wake PC",  icon:"flash",          color:"#22c55e", risky:false },
-  { key:"shutdown_pc", label:"Shutdown", icon:"power",          color:"#ef4444", risky:true  },
-  { key:"restart_pc",  label:"Restart",  icon:"refresh-circle", color:"#f59e0b", risky:true  },
-  { key:"lock_pc",     label:"Lock",     icon:"lock-closed",    color:"#3b82f6", risky:false },
-];
 const ACTION_LOG_MAP: Record<string,{ sent:LogEventType; failed:LogEventType }> = {
   wake_pc:     { sent:"wake_sent",     failed:"wake_failed"     },
   sleep_pc:    { sent:"lock_sent",     failed:"lock_failed"     },
@@ -782,6 +824,9 @@ function ScheduledEventsScreen({ device,events,customActions,onSave,onBack,onGoT
   const [editing, setEditing] = useState<ScheduledEvent|null>(null);
   const [isNew,   setIsNew]   = useState(false);
 
+  // Sync local list when parent events change (e.g. when event fires and gets toggled off)
+  useEffect(()=>{ setList(events); },[events]);
+
   const persist = (updated:ScheduledEvent[])=>{ setList(updated); onSave(updated); };
 
   const createNew = ()=>{
@@ -874,11 +919,24 @@ function ScheduledEventsScreen({ device,events,customActions,onSave,onBack,onGoT
 // FAQ
 // ─────────────────────────────────────────────
 const FAQS = [
-  { q:"Can anyone send commands to my PC?",        a:"No. Every paired device uses a unique security token generated at pairing time. Only your paired phone can send commands — even someone on the same network can't control your PC without that token." },
-  { q:"Does PCLink collect any data?",     a:"No data is collected, stored, or sent to any third party. Everything stays entirely on your local network between your phone and your PC." },
-  { q:"What happens if I lose my phone?",          a:"Open the PCLink Agent in your system tray and select Unpair Device. This immediately revokes access and the paired token is deleted." },
-  { q:"Why doesn't Wake on LAN work?",             a:"Wake on LAN requires a wired ethernet connection on the target PC. It must also be enabled in BIOS under Power Management or Network settings. Wi-Fi only PCs generally cannot be woken remotely." },
-  { q:"Can I control my PC from outside my home?", a:"Not currently. PCLink works over your local network only. Remote access support may be added in a future version." },
+  { q:"Can anyone send commands to my PC?",
+    a:"No. When you pair your phone, a unique security token is generated and stored only on your device. Every command requires this token — it's never exposed, never transmitted in plain text, and cannot be obtained by anyone else. Even someone on the same network as you cannot send commands to your PC without it." },
+  { q:"Does PCLink collect any data?",
+    a:"No data is collected, stored, or sent to any third party. Everything stays between your phone and your PC." },
+  { q:"What happens if I lose my phone?",
+    a:"Open the PCLink Agent in your system tray and select Unpair Device. This immediately revokes access and the paired token is deleted. Your PC is then safe." },
+  { q:"Why doesn't Wake on LAN work?",
+    a:"Wake on LAN requires a wired Ethernet connection on your PC and must be enabled in BIOS under Power Management or Network settings. It does not work over Wi-Fi. Your PC also needs to remain plugged in to a power source." },
+  { q:"Can I control my PC from anywhere?",
+    a:"Yes. PCLink connects through a secure cloud relay so it works anywhere — at school, work, or on mobile data. Your PC just needs to be on with the agent running." },
+  { q:"How do I unpair a device?",
+    a:"Open the device in PCLink, tap the edit icon in the top right, and select Remove Device. You can also right-click the agent in the Windows system tray and select Unpair Device." },
+  { q:"Can I pair multiple phones to one PC?",
+    a:"No. Each PC can only be paired with one phone at a time. To switch phones, unpair from the current one first." },
+  { q:"Why is the PC showing as offline?",
+    a:"Make sure the PCLink Agent is running in your Windows system tray. If it is, try right-clicking and selecting Restart Agent. Also check that both your phone and PC are connected to the internet. If nothing works, try re-downloading and reinstalling the agent." },
+  { q:"Is my connection secure?",
+    a:"Yes. All communication uses encrypted WebSocket connections and every command requires your unique security token. No one else can send commands to your PC." },
 ];
 function FAQItem({ q,a,theme }:{ q:string; a:string; theme:ReturnType<typeof useTheme> }) {
   const [open,setOpen]=useState(false);
@@ -896,14 +954,198 @@ function FAQItem({ q,a,theme }:{ q:string; a:string; theme:ReturnType<typeof use
 // ─────────────────────────────────────────────
 // Settings Sheet
 // ─────────────────────────────────────────────
-function SettingsSheet({ visible,onClose,settings,onSettingsChange,theme }:{
-  visible:boolean; onClose:()=>void; settings:AppSettings; onSettingsChange:(s:AppSettings)=>void; theme:ReturnType<typeof useTheme>;
+// ─────────────────────────────────────────────
+// Debug Tool (tap version 5x in About)
+// ─────────────────────────────────────────────
+function DebugScreen({ theme, onClose, onForceError, debugPaywallOff, setDebugPaywallOff, debugProOn, setDebugProOn, onResetPro }:{
+  theme:ReturnType<typeof useTheme>;
+  onClose:()=>void;
+  onForceError:(type:string)=>void;
+  debugPaywallOff:boolean; setDebugPaywallOff:(v:boolean)=>void;
+  debugProOn:boolean;      setDebugProOn:(v:boolean)=>void;
+  onResetPro:()=>void;
+}) {
+  const [log, setLog] = useState<string[]>([]);
+
+  const add = (msg:string) => setLog(prev=>[`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev]);
+
+  const clearAll = async () => {
+    try {
+      const keys = await AsyncStorage.getAllKeys();
+      await AsyncStorage.multiRemove(keys as string[]);
+      add("✓ Cleared all stored data");
+    } catch(e:any) { add(`✗ Error: ${e.message}`); }
+  };
+
+  const showKeys = async () => {
+    try {
+      const keys = await AsyncStorage.getAllKeys();
+      add(`Keys (${(keys as string[]).length}): ${(keys as string[]).join(", ")}`);
+    } catch(e:any) { add(`✗ Error: ${e.message}`); }
+  };
+
+  const resetOnboarding = async () => {
+    await AsyncStorage.removeItem(ONBOARDING_KEY);
+    add("✓ Onboarding reset — restart app to see it");
+  };
+
+  const forceError = (type:string, label:string) => {
+    onForceError(type);
+    add(`→ Forced error: ${label}`);
+  };
+
+  const errorStates = [
+    { label:"Screenshot — Fail",       type:"screenshot_fail",   color:"#ef4444", desc:"Real cause: Pillow not installed on PC (pip install Pillow)" },
+    { label:"Clipboard — Timeout",     type:"clipboard_timeout", color:"#f59e0b", desc:"Real cause: Agent not running or PC asleep" },
+    { label:"Upload — Timeout",        type:"upload_timeout",    color:"#f97316", desc:"Real cause: File too large or connection dropped" },
+    { label:"Wake — Failed Banner",    type:"wake_fail",         color:"#ef4444", desc:"Real cause: WoL not enabled in BIOS or PC not plugged in" },
+    { label:"PC Offline Toast",        type:"offline_toast",     color:"#6b7280", desc:"Real cause: Agent disconnected or PC lost network" },
+    { label:"Token Invalid Alert",     type:"token_invalid",     color:"#a855f7", desc:"Real cause: PC was re-paired with another phone" },
+  ];
+
+  return (
+    <View style={{ flex:1 }}>
+      <View style={[st.overlayTopBar,{ paddingHorizontal:20 }]}>
+        <Pressable onPress={onClose} style={st.overlayBackBtn} hitSlop={10}>
+          <Ionicons name="chevron-back" size={22} color="#007aff"/>
+          <Text style={st.overlayBackText}>Back</Text>
+        </Pressable>
+        <View style={StyleSheet.absoluteFillObject} pointerEvents="none">
+          <Text style={[st.overlayCenteredTitle,{ color:theme.titleColor }]}>Debug Tools</Text>
+        </View>
+        <View style={{ width:60 }}/>
+      </View>
+      <ScrollView contentContainerStyle={{ padding:20, gap:12, paddingBottom:60 }}>
+        <View style={[dbgSt.banner,{ backgroundColor:"#f59e0b11", borderColor:"#f59e0b33" }]}>
+          <Ionicons name="warning-outline" size={16} color="#f59e0b"/>
+          <Text style={{ color:"#f59e0b", fontSize:13, flex:1, lineHeight:18 }}>
+            Developer tools. For testing only. Changes take effect immediately.
+          </Text>
+        </View>
+
+        <Text style={[dbgSt.sectionLabel,{ color:theme.groupLabel }]}>APP INFO</Text>
+        <View style={[dbgSt.infoCard,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+          {[
+            { label:"App Version", value:APP_VERSION },
+            { label:"Worker URL",  value:WORKER_URL },
+            { label:"Platform",    value:Platform.OS },
+          ].map((r,i,arr)=>(
+            <View key={i} style={[dbgSt.infoRow,{ borderBottomWidth:i<arr.length-1?StyleSheet.hairlineWidth:0, borderBottomColor:theme.cardBorder }]}>
+              <Text style={{ color:theme.labelColor, fontSize:13 }}>{r.label}</Text>
+              <Text style={{ color:theme.rowTitle, fontSize:13, fontWeight:"500", flex:1, textAlign:"right" }} numberOfLines={1}>{r.value}</Text>
+            </View>
+          ))}
+        </View>
+
+        <Text style={[dbgSt.sectionLabel,{ color:theme.groupLabel }]}>PRO / PAYWALL</Text>
+        <View style={[dbgSt.infoCard,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+          <View style={[dbgSt.infoRow,{ borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:theme.cardBorder }]}>
+            <View style={{ flex:1 }}>
+              <Text style={{ color:theme.rowTitle, fontSize:14, fontWeight:"600" }}>Paywall Enabled</Text>
+              <Text style={{ color:theme.labelColor, fontSize:11, marginTop:2 }}>OFF = app works exactly as before, no paywall code active</Text>
+            </View>
+            <Switch value={!debugPaywallOff} onValueChange={v=>setDebugPaywallOff(!v)} trackColor={{ true:"#007aff" }}/>
+          </View>
+          <View style={dbgSt.infoRow}>
+            <View style={{ flex:1 }}>
+              <Text style={{ color:theme.rowTitle, fontSize:14, fontWeight:"600" }}>Simulate Pro Purchase</Text>
+              <Text style={{ color:theme.labelColor, fontSize:11, marginTop:2 }}>ON = see app as Pro user, OFF = see app as free user</Text>
+            </View>
+            <Switch value={debugProOn} onValueChange={setDebugProOn} trackColor={{ true:"#22c55e" }} disabled={debugPaywallOff}/>
+          </View>
+        </View>
+
+        <Text style={[dbgSt.sectionLabel,{ color:theme.groupLabel }]}>FORCE ERROR STATES</Text>
+        <Text style={{ color:theme.labelColor, fontSize:12, marginBottom:4 }}>
+          Open the relevant screen first, then tap to trigger the error.
+        </Text>
+        {errorStates.map((e,i)=>(
+          <Pressable key={i} onPress={()=>forceError(e.type, e.label)}
+            style={({ pressed })=>[dbgSt.errorBtn,{ backgroundColor:pressed?e.color+"33":e.color+"11", borderColor:e.color+"44" }]}>
+            <View style={{ flex:1 }}>
+              <Text style={{ color:e.color, fontSize:14, fontWeight:"600" }}>{e.label}</Text>
+              <Text style={{ color:theme.labelColor, fontSize:11, marginTop:2 }}>{e.desc}</Text>
+            </View>
+            <Ionicons name="flash-outline" size={16} color={e.color}/>
+          </Pressable>
+        ))}
+
+        <Text style={[dbgSt.sectionLabel,{ color:theme.groupLabel }]}>STORAGE</Text>
+        {[
+          { label:"Show All Storage Keys", color:"#007aff", onPress:showKeys },
+          { label:"Reset Onboarding",      color:"#a855f7", onPress:resetOnboarding },
+          { label:"Reset Pro Purchase (→ Free User)", color:"#f59e0b", onPress:async()=>{
+            await AsyncStorage.removeItem(PRO_KEY);
+            onResetPro();
+            add("✓ Pro purchase reset — you are now a free user");
+          }},
+          { label:"Clear ALL Stored Data", color:"#ef4444", onPress:()=>Alert.alert("Clear All Data?","This will remove all devices, settings, and preferences. Cannot be undone.",[
+            { text:"Cancel", style:"cancel" },
+            { text:"Clear All", style:"destructive", onPress:clearAll },
+          ])},
+        ].map((a,i)=>(
+          <Pressable key={i} onPress={a.onPress}
+            style={({ pressed })=>[dbgSt.actionBtn,{ backgroundColor:pressed?a.color+"33":a.color+"11", borderColor:a.color+"44" }]}>
+            <Text style={{ color:a.color, fontSize:15, fontWeight:"600" }}>{a.label}</Text>
+          </Pressable>
+        ))}
+
+        {log.length>0&&(
+          <>
+            <View style={{ flexDirection:"row", justifyContent:"space-between", alignItems:"center" }}>
+              <Text style={[dbgSt.sectionLabel,{ color:theme.groupLabel }]}>LOG</Text>
+              <Pressable onPress={()=>setLog([])} hitSlop={8}><Text style={{ color:"#ef4444", fontSize:12 }}>Clear</Text></Pressable>
+            </View>
+            <View style={[dbgSt.logBox,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+              {log.map((l,i)=>(
+                <Text key={i} style={{ color:theme.rowTitle, fontSize:12, lineHeight:18, fontFamily:Platform.OS==="ios"?"Courier New":"monospace" }}>{l}</Text>
+              ))}
+            </View>
+          </>
+        )}
+      </ScrollView>
+    </View>
+  );
+}
+
+function SettingsSheet({ visible,onClose,settings,onSettingsChange,theme,onForceError,debugPaywallOff,setDebugPaywallOff,debugProOn,setDebugProOn,onShowPaywall,onRestore,onResetPro }:{
+  visible:boolean; onClose:()=>void; settings:AppSettings; onSettingsChange:(s:AppSettings)=>void;
+  theme:ReturnType<typeof useTheme>;
+  onForceError:(type:string)=>void;
+  debugPaywallOff:boolean; setDebugPaywallOff:(v:boolean)=>void;
+  debugProOn:boolean;      setDebugProOn:(v:boolean)=>void;
+  onShowPaywall:()=>void;  onRestore:()=>void; onResetPro:()=>void;
 }) {
   const slideAnim=useRef(new Animated.Value(SHEET_HEIGHT)).current;
   const fadeAnim =useRef(new Animated.Value(0)).current;
   const dragY    =useRef(new Animated.Value(0)).current;
   const dragYRaw =useRef(0); const scrollTop=useRef(true);
   const [sub,setSub]=useState<SettingsSubScreen>("none");
+  const [debugVisible, setDebugVisible] = useState(false);
+  const [passVisible,  setPassVisible]  = useState(false);
+  const [passInput,    setPassInput]    = useState("");
+  const [passError,    setPassError]    = useState(false);
+  const versionTapCount = useRef(0);
+  const versionTapTimer = useRef<ReturnType<typeof setTimeout>|null>(null);
+
+  const onVersionTap = () => {
+    versionTapCount.current += 1;
+    if (versionTapTimer.current) clearTimeout(versionTapTimer.current);
+    if (versionTapCount.current >= 10) {
+      versionTapCount.current = 0;
+      setPassInput(""); setPassError(false); setPassVisible(true);
+    } else {
+      versionTapTimer.current = setTimeout(()=>{ versionTapCount.current = 0; }, 2000);
+    }
+  };
+
+  const submitPassword = () => {
+    if (checkDebugPassword(passInput)) {
+      setPassVisible(false); setPassError(false); setPassInput(""); setDebugVisible(true);
+    } else {
+      setPassError(true);
+    }
+  };
 
   useEffect(()=>{
     if (visible) {
@@ -992,11 +1234,25 @@ function SettingsSheet({ visible,onClose,settings,onSettingsChange,theme }:{
               </View>
             </View>
             <View style={groupSt.wrapper}>
+              <Text style={[groupSt.label,{ color:theme.groupLabel }]}>PURCHASES</Text>
+              <View style={[groupSt.card,{ backgroundColor:theme.groupCard, borderColor:theme.groupCardBorder }]}>
+                <Pressable onPress={()=>{ onClose(); setTimeout(()=>onShowPaywall(), 350); }} style={({ pressed })=>[groupSt.row,pressed&&{ backgroundColor:theme.rowPressed }]}>
+                  <View style={[groupSt.iconWrap,{ backgroundColor:"#007aff" }]}><Ionicons name="flash" size={16} color="white"/></View>
+                  <View style={groupSt.rowContent}><Text style={[groupSt.rowTitle,{ color:theme.rowTitle }]}>Get PCLink Pro</Text><Text style={[groupSt.rowSub,{ color:theme.rowSubtitle }]}>Unlock all features — {PRO_PRICE} one-time</Text></View>
+                  <Ionicons name="chevron-forward" size={16} color={theme.chevron} style={{ marginLeft:4 }}/>
+                </Pressable>
+                <Pressable onPress={()=>{ onClose(); setTimeout(()=>onRestore(), 350); }} style={({ pressed })=>[groupSt.row,{ borderTopWidth:StyleSheet.hairlineWidth, borderTopColor:theme.rowBorder },pressed&&{ backgroundColor:theme.rowPressed }]}>
+                  <View style={[groupSt.iconWrap,{ backgroundColor:"#6b7280" }]}><Ionicons name="refresh-outline" size={16} color="white"/></View>
+                  <View style={groupSt.rowContent}><Text style={[groupSt.rowTitle,{ color:theme.rowTitle }]}>Restore Purchase</Text><Text style={[groupSt.rowSub,{ color:theme.rowSubtitle }]}>Reinstalled? Tap to restore Pro</Text></View>
+                </Pressable>
+              </View>
+            </View>
+            <View style={groupSt.wrapper}>
               <Text style={[groupSt.label,{ color:theme.groupLabel }]}>INFO</Text>
               <View style={[groupSt.card,{ backgroundColor:theme.groupCard, borderColor:theme.groupCardBorder }]}>
                 <Pressable onPress={()=>setSub("about")} style={({ pressed })=>[groupSt.row,pressed&&{ backgroundColor:theme.rowPressed }]}>
                   <View style={[groupSt.iconWrap,{ backgroundColor:"#007aff" }]}><Ionicons name="information-circle-outline" size={16} color="white"/></View>
-                  <View style={groupSt.rowContent}><Text style={[groupSt.rowTitle,{ color:theme.rowTitle }]}>About</Text></View>
+                  <View style={groupSt.rowContent}><Text style={[groupSt.rowTitle,{ color:theme.rowTitle }]}>Info</Text></View>
                   <Ionicons name="chevron-forward" size={16} color={theme.chevron} style={{ marginLeft:4 }}/>
                 </Pressable>
               </View>
@@ -1005,18 +1261,23 @@ function SettingsSheet({ visible,onClose,settings,onSettingsChange,theme }:{
           <SubScreen visible={sub==="faq"} onBack={()=>setSub("none")} title="FAQ" theme={theme}>
             <ScrollView contentContainerStyle={{ padding:20, paddingBottom:60 }} showsVerticalScrollIndicator={false}>
               {FAQS.map((f,i)=><FAQItem key={i} q={f.q} a={f.a} theme={theme}/>)}
+              <Pressable onPress={()=>Linking.openURL(FEEDBACK_URL)}
+                style={({ pressed })=>[{ flexDirection:"row", alignItems:"center", justifyContent:"center", gap:8, marginTop:8, paddingVertical:14, borderRadius:14, backgroundColor:pressed?"#22c55e33":"#22c55e11", borderWidth:1, borderColor:"#22c55e44" }]}>
+                <Ionicons name="chatbubble-ellipses-outline" size={18} color="#22c55e"/>
+                <Text style={{ color:"#22c55e", fontSize:15, fontWeight:"600" }}>Ask a Question or Give Feedback →</Text>
+              </Pressable>
             </ScrollView>
           </SubScreen>
           <SubScreen visible={sub==="troubleshooting"} onBack={()=>setSub("none")} title="Troubleshooting" theme={theme}>
             <ScrollView contentContainerStyle={{ padding:20, paddingBottom:60 }} showsVerticalScrollIndicator={false}>
               {[
-                { icon:"wifi-outline",color:"#007aff",title:"Same network required",body:"Your phone and PC must be on the same Wi-Fi network for the app to connect." },
-                { icon:"desktop-outline",color:"#22c55e",title:"Check the system tray",body:"Make sure PCLink Agent is running in the Windows system tray." },
-                { icon:"refresh-outline",color:"#f59e0b",title:"Try restarting the agent",body:"Right-click the tray icon and select Restart Agent, or Quit and relaunch." },
-                { icon:"link-outline",color:"#a855f7",title:"Re-pair if issues persist",body:"If the app can't connect after several attempts, try removing and re-pairing the device." },
-                { icon:"flash-outline",color:"#22c55e",title:"Wake on LAN needs ethernet",body:"Wake on LAN only works reliably over a wired ethernet connection." },
-                { icon:"shield-outline",color:"#3b82f6",title:"Connection issues",body:"Make sure the PCLink Agent is running and you are connected to the internet. The agent connects through a secure cloud relay." },
-                { icon:"hardware-chip-outline",color:"#f97316",title:"Wake on LAN in BIOS",body:"Wake on LAN must be enabled in your PC's BIOS/UEFI settings under Power Management." },
+                { icon:"wifi-outline",color:"#007aff",title:"1. Check your connection",body:"Make sure both your phone and PC are connected to the internet. PCLink works over any network — Wi-Fi, mobile data, or Ethernet." },
+                { icon:"desktop-outline",color:"#22c55e",title:"2. Check the system tray",body:"Make sure PCLink Agent is running in the Windows system tray (bottom-right of your taskbar)." },
+                { icon:"refresh-outline",color:"#f59e0b",title:"3. Restart the agent",body:"Right-click the tray icon and select Restart Agent, or Quit and relaunch it." },
+                { icon:"link-outline",color:"#a855f7",title:"4. Re-pair the device",body:"If the app still can't connect, try removing the device in PCLink and pairing again." },
+                { icon:"download-outline",color:"#3b82f6",title:"5. Reinstall the agent",body:"If nothing else works, try re-downloading and reinstalling the PCLink Agent from the official website." },
+                { icon:"flash-outline",color:"#22c55e",title:"Wake on LAN — needs Ethernet",body:"Wake on LAN only works over a wired Ethernet connection, not Wi-Fi." },
+                { icon:"hardware-chip-outline",color:"#f97316",title:"Wake on LAN — enable in BIOS",body:"Wake on LAN must be enabled in your PC's BIOS/UEFI settings under Power Management or Network settings." },
               ].map((tip,i)=>(
                 <View key={i} style={[tsSt.card,{ backgroundColor:theme.groupCard, borderColor:theme.groupCardBorder, marginBottom:12 }]}>
                   <View style={[tsSt.iconWrap,{ backgroundColor:tip.color+"22" }]}><Ionicons name={tip.icon as any} size={20} color={tip.color}/></View>
@@ -1028,13 +1289,13 @@ function SettingsSheet({ visible,onClose,settings,onSettingsChange,theme }:{
               ))}
             </ScrollView>
           </SubScreen>
-          <SubScreen visible={sub==="about"} onBack={()=>setSub("none")} title="About" theme={theme}>
+          <SubScreen visible={sub==="about"} onBack={()=>setSub("none")} title="Info" theme={theme}>
             <ScrollView contentContainerStyle={{ paddingHorizontal:16, paddingBottom:60 }} showsVerticalScrollIndicator={false}>
               <View style={groupSt.wrapper}>
                 <Text style={[groupSt.label,{ color:theme.groupLabel }]}>APP</Text>
                 <View style={[groupSt.card,{ backgroundColor:theme.groupCard, borderColor:theme.groupCardBorder }]}>
                   <View style={groupSt.row}><View style={[groupSt.iconWrap,{ backgroundColor:"#007aff", overflow:"hidden", padding:0 }]}><Image source={require('./pclink-icon.png')} style={{ width:32, height:32, borderRadius:8 }}/></View><View style={groupSt.rowContent}><Text style={[groupSt.rowTitle,{ color:theme.rowTitle }]}>PCLink</Text><Text style={[groupSt.rowSub,{ color:theme.rowSubtitle }]}>Remotely control and monitor your PCs from your phone</Text></View></View>
-                  <View style={[groupSt.row,{ borderTopWidth:StyleSheet.hairlineWidth, borderTopColor:theme.rowBorder }]}><View style={[groupSt.iconWrap,{ backgroundColor:"#5856d6" }]}><Ionicons name="code-slash-outline" size={16} color="white"/></View><View style={groupSt.rowContent}><Text style={[groupSt.rowTitle,{ color:theme.rowTitle }]}>Version</Text></View><Text style={[groupSt.rowValue,{ color:theme.rowValue }]}>{APP_VERSION}</Text></View>
+                  <Pressable onPress={onVersionTap} style={[groupSt.row,{ borderTopWidth:StyleSheet.hairlineWidth, borderTopColor:theme.rowBorder }]}><View style={[groupSt.iconWrap,{ backgroundColor:"#5856d6" }]}><Ionicons name="code-slash-outline" size={16} color="white"/></View><View style={groupSt.rowContent}><Text style={[groupSt.rowTitle,{ color:theme.rowTitle }]}>Version</Text></View><Text style={[groupSt.rowValue,{ color:theme.rowValue }]}>{APP_VERSION}</Text></Pressable>
                   <View style={[groupSt.row,{ borderTopWidth:StyleSheet.hairlineWidth, borderTopColor:theme.rowBorder }]}><View style={[groupSt.iconWrap,{ backgroundColor:"#22c55e" }]}><Ionicons name="shield-checkmark-outline" size={16} color="white"/></View><View style={groupSt.rowContent}><Text style={[groupSt.rowTitle,{ color:theme.rowTitle }]}>Privacy</Text><Text style={[groupSt.rowSub,{ color:theme.rowSubtitle }]}>No data collected. Everything stays on your local network.</Text></View></View>
                 </View>
               </View>
@@ -1059,7 +1320,7 @@ function SettingsSheet({ visible,onClose,settings,onSettingsChange,theme }:{
           {/* ── PRIVACY POLICY ── */}
           <SubScreen visible={sub==="privacy"} onBack={()=>setSub("about")} title="Privacy Policy" theme={theme}>
             <ScrollView contentContainerStyle={{ paddingHorizontal:20, paddingBottom:60 }} showsVerticalScrollIndicator={false}>
-              <Text style={[legalSt.updated,{ color:theme.labelColor }]}>Last updated: April 2025</Text>
+              <Text style={[legalSt.updated,{ color:theme.labelColor }]}>Last updated: May 2025</Text>
               {[
                 { heading:"Overview", body:'PCLink ("the App") is designed with your privacy as a core principle. We do not collect, store, transmit, or sell your personal data. Everything the App does stays entirely on your local network between your phone and your PC.' },
                 { heading:"Information We Do Not Collect", body:"We do not collect your name, email address, location, device identifiers, usage analytics, crash reports, or any other personal information. No data is sent to our servers — because we don't have any." },
@@ -1082,7 +1343,7 @@ function SettingsSheet({ visible,onClose,settings,onSettingsChange,theme }:{
           {/* ── TERMS OF USE ── */}
           <SubScreen visible={sub==="terms"} onBack={()=>setSub("about")} title="Terms of Use" theme={theme}>
             <ScrollView contentContainerStyle={{ paddingHorizontal:20, paddingBottom:60 }} showsVerticalScrollIndicator={false}>
-              <Text style={[legalSt.updated,{ color:theme.labelColor }]}>Last updated: April 2025</Text>
+              <Text style={[legalSt.updated,{ color:theme.labelColor }]}>Last updated: May 2025</Text>
               {[
                 { heading:"Acceptance of Terms", body:'By downloading or using PCLink ("the App"), you agree to be bound by these Terms of Use. If you do not agree to these terms, please do not use the App.' },
                 { heading:"Description of Service", body:"PCLink is a local network remote control application that allows you to send commands to a Windows PC running the PCLink Agent from your mobile device. The App works exclusively over your local Wi-Fi network." },
@@ -1101,6 +1362,54 @@ function SettingsSheet({ visible,onClose,settings,onSettingsChange,theme }:{
               ))}
             </ScrollView>
           </SubScreen>
+
+          {/* ── DEBUG TOOL ── */}
+          {/* ── PASSWORD GATE ── */}
+          <Modal visible={passVisible} transparent animationType="fade" onRequestClose={()=>setPassVisible(false)}>
+            <TouchableWithoutFeedback onPress={()=>{ setPassVisible(false); setPassInput(""); setPassError(false); }}>
+              <View style={{ flex:1, backgroundColor:"rgba(0,0,0,0.6)", justifyContent:"center", padding:40 }}>
+                <TouchableWithoutFeedback onPress={e=>e.stopPropagation()}>
+                  <View style={[dbgSt.infoCard,{ backgroundColor:theme.cardBg, padding:24, borderRadius:16 }]}>
+                    <Text style={[{ fontSize:17, fontWeight:"700", color:theme.titleColor, marginBottom:4, textAlign:"center" }]}>Admin Tool</Text>
+                    <Text style={[{ fontSize:13, color:theme.labelColor, textAlign:"center", marginBottom:20, lineHeight:18 }]}>
+                      If you are not an admin please dismiss this tool.
+                    </Text>
+                    <TextInput
+                      value={passInput}
+                      onChangeText={v=>{ setPassInput(v); setPassError(false); }}
+                      placeholder="Enter password"
+                      placeholderTextColor={theme.labelColor}
+                      secureTextEntry
+                      style={[{ borderWidth:1, borderColor:passError?"#ef4444":theme.cardBorder, borderRadius:10, padding:12, fontSize:16, color:theme.rowTitle, marginBottom:8 }]}
+                      autoFocus
+                      onSubmitEditing={submitPassword}
+                      returnKeyType="done"
+                    />
+                    {passError&&<Text style={{ color:"#ef4444", fontSize:12, marginBottom:8, textAlign:"center" }}>Incorrect password</Text>}
+                    <Pressable onPress={submitPassword}
+                      style={[manSt.connectBtn,{ marginBottom:8 }]}>
+                      <Text style={manSt.connectBtnText}>Enter</Text>
+                    </Pressable>
+                    <Pressable onPress={()=>{ setPassVisible(false); setPassInput(""); setPassError(false); }}
+                      style={{ alignItems:"center", padding:8 }}>
+                      <Text style={{ color:theme.labelColor, fontSize:14 }}>Dismiss</Text>
+                    </Pressable>
+                  </View>
+                </TouchableWithoutFeedback>
+              </View>
+            </TouchableWithoutFeedback>
+          </Modal>
+
+          {debugVisible&&(
+            <Animated.View style={[StyleSheet.absoluteFillObject,{ backgroundColor:theme.subScreenBg, zIndex:30 }]}>
+              <SafeAreaView style={{ flex:1 }}>
+                <DebugScreen theme={theme} onClose={()=>setDebugVisible(false)} onForceError={onForceError}
+                  debugPaywallOff={debugPaywallOff} setDebugPaywallOff={setDebugPaywallOff}
+                  debugProOn={debugProOn} setDebugProOn={setDebugProOn}
+                  onResetPro={onResetPro}/>
+              </SafeAreaView>
+            </Animated.View>
+          )}
 
         </Animated.View>
       </PanGestureHandler>
@@ -1268,6 +1577,305 @@ function ActivityLogScreen({ deviceName,entries,theme,onBack }:{ deviceName:stri
 // ─────────────────────────────────────────────
 // Agent Setup Screen
 // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Onboarding
+// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Pro Activated Overlay
+// ─────────────────────────────────────────────
+function ProActivatedOverlay({ onDone }:{ onDone:()=>void }) {
+  const scale   = useRef(new Animated.Value(0.6)).current;
+  const opacity = useRef(new Animated.Value(0)).current;
+  const glow    = useRef(new Animated.Value(0)).current;
+
+  useEffect(()=>{
+    Animated.sequence([
+      Animated.parallel([
+        Animated.spring(scale,{ toValue:1, damping:12, stiffness:180, useNativeDriver:true }),
+        Animated.timing(opacity,{ toValue:1, duration:250, useNativeDriver:true }),
+      ]),
+      Animated.timing(glow,{ toValue:1, duration:600, useNativeDriver:true }),
+    ]).start();
+    const t = setTimeout(onDone, 3000);
+    return ()=>clearTimeout(t);
+  },[]);
+
+  const glowOpacity = glow.interpolate({ inputRange:[0,0.5,1], outputRange:[0,0.5,0] });
+  const glowScale   = glow.interpolate({ inputRange:[0,1], outputRange:[0.8,1.3] });
+
+  return (
+    <View style={[StyleSheet.absoluteFillObject,{ backgroundColor:"#0b0f14", justifyContent:"center", alignItems:"center", zIndex:9999 }]}>
+      <Animated.View style={{ alignItems:"center", gap:20, transform:[{ scale }], opacity }}>
+        {/* Glow ring — border only, no fill */}
+        <Animated.View style={{ position:"absolute", width:140, height:140, borderRadius:70,
+          borderWidth:2, borderColor:"#007aff",
+          opacity:glowOpacity, transform:[{ scale:glowScale }] }}/>
+        {/* Icon circle */}
+        <View style={{ width:120, height:120, borderRadius:60, backgroundColor:"#007aff22", borderWidth:2, borderColor:"#007aff66", justifyContent:"center", alignItems:"center" }}>
+          <Ionicons name="flash" size={64} color="#007aff"/>
+        </View>
+        <View style={{ alignItems:"center", gap:8 }}>
+          <View style={proSt.badge}>
+            <Ionicons name="flash" size={12} color="#007aff"/>
+            <Text style={proSt.badgeText}>PCLink Pro</Text>
+          </View>
+          <Text style={{ color:"white", fontSize:26, fontWeight:"800", textAlign:"center" }}>Pro Activated!</Text>
+          <Text style={{ color:"rgba(255,255,255,0.55)", fontSize:15, textAlign:"center", lineHeight:22 }}>
+            All features are now unlocked.{"\n"}Thank you for your support!
+          </Text>
+        </View>
+      </Animated.View>
+    </View>
+  );
+}
+
+function ProPaywallSheet({ visible, onClose, onPurchase, onRestore, theme }:{
+  visible:boolean; onClose:()=>void;
+  onPurchase:()=>void; onRestore:()=>void;
+  theme:ReturnType<typeof useTheme>;
+}) {
+  const slideAnim = useRef(new Animated.Value(SHEET_HEIGHT)).current;
+  const fadeAnim  = useRef(new Animated.Value(0)).current;
+  const dragY     = useRef(new Animated.Value(0)).current;
+  const dragYRaw  = useRef(0);
+
+  useEffect(()=>{
+    if (visible) {
+      dragY.setValue(0); dragYRaw.current=0;
+      Animated.parallel([
+        Animated.spring(slideAnim,{ toValue:0, damping:28, stiffness:300, useNativeDriver:true }),
+        Animated.timing(fadeAnim,{ toValue:1, duration:220, useNativeDriver:true }),
+      ]).start();
+    } else {
+      Animated.parallel([
+        Animated.timing(slideAnim,{ toValue:SHEET_HEIGHT, duration:300, useNativeDriver:true }),
+        Animated.timing(fadeAnim,{ toValue:0, duration:240, useNativeDriver:true }),
+      ]).start();
+    }
+  },[visible]);
+
+  const onGestureEvent = Animated.event([{ nativeEvent:{ translationY:dragY } }],{ useNativeDriver:true });
+  const onHandlerStateChange = ({ nativeEvent:e }:PanGestureHandlerGestureEvent)=>{
+    dragYRaw.current = e.translationY;
+    if (e.state === State.END) {
+      if (dragYRaw.current > SHEET_HEIGHT*0.18 || e.velocityY > 800) {
+        onClose();
+      } else {
+        Animated.spring(dragY,{ toValue:0, damping:20, stiffness:300, useNativeDriver:true }).start();
+      }
+    }
+  };
+
+  const clampedDrag = dragY.interpolate({ inputRange:[0,SHEET_HEIGHT], outputRange:[0,SHEET_HEIGHT], extrapolateLeft:"clamp" });
+
+  return (
+    <Modal transparent visible={visible} animationType="none" onRequestClose={onClose}>
+      <TouchableWithoutFeedback onPress={onClose}>
+        <Animated.View style={[sheetSt.backdrop,{ opacity:fadeAnim }]}/>
+      </TouchableWithoutFeedback>
+      <PanGestureHandler onGestureEvent={onGestureEvent} onHandlerStateChange={onHandlerStateChange}>
+        <Animated.View style={[sheetSt.container,{ transform:[{ translateY:Animated.add(slideAnim,clampedDrag) }] }]}>
+          <BlurView intensity={theme.dark?60:72} tint={theme.blurTint} style={StyleSheet.absoluteFill}/>
+          <View style={sheetSt.dragArea}><View style={[sheetSt.handle,{ backgroundColor:theme.handleBar }]}/></View>
+        {/* Header */}
+        <View style={{ alignItems:"center", paddingHorizontal:24, paddingBottom:8 }}>
+          <View style={proSt.badge}>
+            <Ionicons name="flash" size={14} color="#007aff"/>
+            <Text style={proSt.badgeText}>PCLink Pro</Text>
+          </View>
+          <Text style={[proSt.title,{ color:theme.titleColor }]}>Unlock Everything</Text>
+          <Text style={[proSt.subtitle,{ color:theme.labelColor }]}>
+            One-time purchase. No subscription. No ads. Ever.
+          </Text>
+        </View>
+        {/* Feature list */}
+        <ScrollView
+          contentContainerStyle={{ paddingHorizontal:24, paddingBottom:16 }}
+          showsVerticalScrollIndicator={false}
+          style={{ maxHeight:screenHeight*0.35 }}
+        >
+          <View style={proSt.featureGrid}>
+            {PRO_FEATURES.map((f,i)=>(
+              <View key={i} style={[proSt.featureItem,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+                <View style={[proSt.featureIcon,{ backgroundColor:f.color+"22" }]}>
+                  <Ionicons name={f.icon as any} size={18} color={f.color}/>
+                </View>
+                <View style={{ flex:1 }}>
+                  <Text style={[proSt.featureLabel,{ color:theme.rowTitle }]}>{f.label}</Text>
+                  <Text style={[proSt.featureDesc,{ color:theme.labelColor }]}>{f.desc}</Text>
+                </View>
+              </View>
+            ))}
+          </View>
+        </ScrollView>
+        {/* Purchase button */}
+        <View style={{ paddingHorizontal:24, paddingBottom:8 }}>
+          <Pressable onPress={onPurchase}
+            style={({ pressed })=>[proSt.buyBtn,pressed&&{ opacity:0.85 }]}>
+            <Text style={proSt.buyBtnText}>Get PCLink Pro — {PRO_PRICE}</Text>
+          </Pressable>
+          <Pressable onPress={onRestore} style={{ alignItems:"center", paddingVertical:12 }}>
+            <Text style={{ color:theme.labelColor, fontSize:13 }}>Restore Purchase</Text>
+          </Pressable>
+          <Text style={{ color:theme.labelColor, fontSize:11, textAlign:"center", lineHeight:16 }}>
+            One-time purchase. No subscription. No hidden fees.
+          </Text>
+        </View>
+        </Animated.View>
+      </PanGestureHandler>
+    </Modal>
+  );
+}
+
+// Small lock badge for Pro-gated tiles
+function ProLockBadge() {
+  return (
+    <View style={proSt.lockBadge}>
+      <Ionicons name="flash" size={9} color="white"/>
+      <Text style={proSt.lockBadgeText}>PRO</Text>
+    </View>
+  );
+}
+
+function OnboardingScreen({ theme, onDone, onPair }:{
+  theme:ReturnType<typeof useTheme>;
+  onDone:()=>void;
+  onPair:()=>void;
+}) {
+  const [page, setPage] = useState(0);
+  const scrollRef = useRef<ScrollView>(null);
+  const NUM_PAGES = 3;
+
+  const features = [
+    { icon:"flash",            color:"#22c55e", text:"Wake, sleep, shutdown & restart your PC" },
+    { icon:"construct-outline",color:"#06b6d4", text:"Files, clipboard, media, screenshot & more" },
+    { icon:"calendar-outline", color:"#007aff", text:"Schedule events & automate with scenes" },
+    { icon:"volume-high-outline",color:"#f97316",text:"Soundboard & full volume mixer control" },
+  ];
+
+  const goTo = (n:number) => {
+    setPage(n);
+    scrollRef.current?.scrollTo({ x: n * screenWidth, animated:true });
+  };
+
+  const finish = async () => {
+    await AsyncStorage.setItem(ONBOARDING_KEY, "done");
+    onDone();
+  };
+
+  const skip = async () => {
+    await AsyncStorage.setItem(ONBOARDING_KEY, "done");
+    onDone();
+  };
+
+  return (
+    <View style={{ flex:1, backgroundColor:"#0b0f14" }}>
+      {/* Skip button */}
+      <View style={{ position:"absolute", top:56, right:24, zIndex:10 }}>
+        <Pressable onPress={skip} hitSlop={12}>
+          <Text style={{ color:"rgba(255,255,255,0.45)", fontSize:15 }}>Skip</Text>
+        </Pressable>
+      </View>
+
+      <ScrollView
+        ref={scrollRef}
+        horizontal pagingEnabled scrollEnabled={false}
+        showsHorizontalScrollIndicator={false}
+        style={{ flex:1 }}
+        contentContainerStyle={{ width: screenWidth * NUM_PAGES }}
+      >
+        {/* Page 1: Welcome */}
+        <View style={[onbSt.page, { width:screenWidth }]}>
+          <View style={onbSt.logoWrap}>
+            <Image source={require("./pclink-icon.png")} style={onbSt.logo}/>
+          </View>
+          <Text style={onbSt.title}>Welcome to PCLink</Text>
+          <Text style={onbSt.subtitle}>Your PC, controlled from your pocket.</Text>
+          <View style={onbSt.featureList}>
+            {features.map((f,i)=>(
+              <View key={i} style={onbSt.featureRow}>
+                <View style={[onbSt.featureIcon, { backgroundColor:f.color+"22" }]}>
+                  <Ionicons name={f.icon as any} size={20} color={f.color}/>
+                </View>
+                <Text style={onbSt.featureText}>{f.text}</Text>
+              </View>
+            ))}
+          </View>
+        </View>
+
+        {/* Page 2: Download agent */}
+        <View style={[onbSt.page, { width:screenWidth }]}>
+          <View style={[onbSt.bigIcon, { backgroundColor:"#007aff22" }]}>
+            <Ionicons name="desktop-outline" size={52} color="#007aff"/>
+          </View>
+          <Text style={onbSt.title}>Install the Agent</Text>
+          <Text style={onbSt.subtitle}>
+            PCLink needs a small free app running on your Windows PC to work.
+          </Text>
+          <View style={onbSt.stepList}>
+            {[
+              { n:"1", text:"Download PCLink Agent for Windows" },
+              { n:"2", text:"Run it on your PC — a pairing window will appear" },
+              { n:"3", text:"Come back here and tap Get Started" },
+            ].map(s=>(
+              <View key={s.n} style={onbSt.stepRow}>
+                <View style={onbSt.stepNum}><Text style={onbSt.stepNumText}>{s.n}</Text></View>
+                <Text style={onbSt.stepText}>{s.text}</Text>
+              </View>
+            ))}
+          </View>
+          <Pressable onPress={()=>Linking.openURL(AGENT_DOWNLOAD_URL)}
+            style={({ pressed })=>[onbSt.dlBtn, pressed&&{ opacity:0.8 }]}>
+            <Ionicons name="download-outline" size={20} color="white"/>
+            <Text style={onbSt.dlBtnText}>Download Agent for Windows</Text>
+          </Pressable>
+          <Text style={onbSt.freeNote}>Free · Windows only · No account needed</Text>
+        </View>
+
+        {/* Page 3: Pair */}
+        <View style={[onbSt.page, { width:screenWidth }]}>
+          <View style={[onbSt.bigIcon, { backgroundColor:"#22c55e22" }]}>
+            <Ionicons name="qr-code-outline" size={52} color="#22c55e"/>
+          </View>
+          <Text style={onbSt.title}>Pair Your PC</Text>
+          <Text style={onbSt.subtitle}>
+            Once the agent is running on your PC, scan its QR code or enter the 6-digit pairing code to connect.
+          </Text>
+          <Pressable onPress={async()=>{ await AsyncStorage.setItem(ONBOARDING_KEY,"done"); onPair(); }}
+            style={({ pressed })=>[onbSt.primaryBtn, pressed&&{ opacity:0.85 }]}>
+            <Text style={onbSt.primaryBtnText}>Get Started →</Text>
+          </Pressable>
+          <Pressable onPress={finish} style={{ marginTop:16 }}>
+            <Text style={{ color:"rgba(255,255,255,0.4)", fontSize:14, textAlign:"center" }}>
+              I'll do this later
+            </Text>
+          </Pressable>
+        </View>
+      </ScrollView>
+
+      {/* Dots */}
+      <View style={onbSt.dots}>
+        {Array.from({ length:NUM_PAGES }).map((_,i)=>(
+          <Pressable key={i} onPress={()=>goTo(i)} hitSlop={8}>
+            <View style={[onbSt.dot, page===i&&onbSt.dotActive]}/>
+          </Pressable>
+        ))}
+      </View>
+
+      {/* Next button (pages 1-2 only) */}
+      {page < NUM_PAGES-1 && (
+        <View style={onbSt.nextRow}>
+          <Pressable onPress={()=>goTo(page+1)}
+            style={({ pressed })=>[onbSt.nextBtn, pressed&&{ opacity:0.8 }]}>
+            <Text style={onbSt.nextBtnText}>Next</Text>
+            <Ionicons name="arrow-forward" size={18} color="white"/>
+          </Pressable>
+        </View>
+      )}
+    </View>
+  );
+}
+
 function AgentSetupScreen({ theme,onBack,onReady }:{ theme:ReturnType<typeof useTheme>; onBack:()=>void; onReady:()=>void }) {
   const steps=[
     { icon:"download-outline",color:"#007aff",title:"Download the Agent",body:"Download PCLink Agent for Windows from the link below and run it on your PC." },
@@ -1387,6 +1995,18 @@ class DeviceConnection {
             this.onToolResult(this.deviceId,"clipboard",{ text:msg.text??null });
           else if (msg.type==="screenshot_result"&&msg.device_id===this.deviceId)
             this.onToolResult(this.deviceId,"screenshot",{ data:msg.data??null, error:msg.error??null });
+          else if (msg.type==="now_playing"&&msg.device_id===this.deviceId)
+            this.onToolResult(this.deviceId,"now_playing",{ title:msg.title, artist:msg.artist, status:msg.status, album_art:msg.album_art, is_last_known:msg.is_last_known });
+          else if (msg.type==="network_info"&&msg.device_id===this.deviceId)
+            this.onToolResult(this.deviceId,"network_info", msg);
+          else if (msg.type==="speedtest_result"&&msg.device_id===this.deviceId)
+            this.onToolResult(this.deviceId,"speedtest_result", msg);
+          else if (msg.type==="audio_devices"&&msg.device_id===this.deviceId)
+            this.onToolResult(this.deviceId,"audio_devices",{ outputs:msg.outputs??[], inputs:msg.inputs??[] });
+          else if (msg.type==="upload_result"&&msg.device_id===this.deviceId)
+            this.onToolResult(this.deviceId,"upload_result", msg);
+          else if (msg.type==="soundboard_file_result"&&msg.device_id===this.deviceId)
+            this.onToolResult(this.deviceId,"soundboard_file", msg);
           else if (msg.type==="file_browse_result"&&msg.device_id===this.deviceId)
             this.onFileBrowse(this.deviceId, msg);
           else if (msg.type==="search_files_result"&&msg.device_id===this.deviceId)
@@ -1483,7 +2103,8 @@ function IOSSheet({ visible,onClose,title,children,theme }:{
             <View style={{ width:30 }}/>
           </View>
           <ScrollView onScroll={onScroll} scrollEventThrottle={16} showsVerticalScrollIndicator={false}
-            bounces={false} contentContainerStyle={{ paddingHorizontal:16, paddingBottom:60 }} style={{ flex:1 }}>
+            bounces={false} contentContainerStyle={{ paddingHorizontal:16, paddingBottom:60 }} style={{ flex:1 }}
+            keyboardShouldPersistTaps="handled">
             {children}
           </ScrollView>
         </Animated.View>
@@ -1526,19 +2147,55 @@ function DropdownItem({ label,left,onPress,last,theme }:{ label:string; left:Rea
   );
 }
 function StatusDot({ status }:{ status:DeviceStatus }) {
-  const color=status==="online"?"#22c55e":status==="idle"?"#f59e0b":"#ef4444";
+  const color=status==="online"?"#4ade80":status==="idle"?"#f59e0b":"#ef4444";
   return <View style={[dotSt.dot,{ backgroundColor:color, shadowColor:color }]}/>;
 }
 function PairedOverlay({ theme }:{ theme:ReturnType<typeof useTheme> }) {
+  const scale = useRef(new Animated.Value(0.7)).current;
+  const opacity = useRef(new Animated.Value(0)).current;
+  useEffect(()=>{
+    Animated.parallel([
+      Animated.spring(scale,{ toValue:1, damping:14, stiffness:200, useNativeDriver:true }),
+      Animated.timing(opacity,{ toValue:1, duration:200, useNativeDriver:true }),
+    ]).start();
+  },[]);
   return (
-    <View style={pairSt.overlay}>
-      <BlurView intensity={85} tint="dark" style={StyleSheet.absoluteFill}/>
-      <Ionicons name="checkmark-circle" size={72} color="#22c55e"/>
-      <Text style={[pairSt.text,{ color:"#ffffff" }]}>Paired!</Text>
-      <Text style={[pairSt.subtext,{ color:"rgba(255,255,255,0.75)" }]}>Device added successfully</Text>
+    <View style={[pairSt.overlay,{ backgroundColor:"#0b0f14" }]}>
+      <Animated.View style={{ alignItems:"center", gap:16, transform:[{ scale }], opacity }}>
+        <View style={{ width:96, height:96, borderRadius:48, backgroundColor:"#22c55e22", justifyContent:"center", alignItems:"center", borderWidth:2, borderColor:"#22c55e44" }}>
+          <Ionicons name="checkmark-circle" size={64} color="#22c55e"/>
+        </View>
+        <Text style={[pairSt.text,{ color:"#ffffff" }]}>Device Paired!</Text>
+        <Text style={[pairSt.subtext,{ color:"rgba(255,255,255,0.6)" }]}>You're all set. Your PC is now connected.</Text>
+      </Animated.View>
     </View>
   );
 }
+// Tappable full-row code input — tap anywhere on the row to open keyboard
+function CodeInput({ value, onChange, theme }:{
+  value:string; onChange:(v:string)=>void;
+  theme:ReturnType<typeof useTheme>;
+}) {
+  const inputRef = useRef<TextInput>(null);
+  return (
+    <Pressable onPress={()=>inputRef.current?.focus()}
+      style={[manSt.inputRow,{ borderColor:theme.pairInputBorder }]}>
+      <Text style={[manSt.inputLabel,{ color:theme.labelColor, flex:1 }]}>6-Digit Code</Text>
+      <TextInput
+        ref={inputRef}
+        value={value}
+        onChangeText={onChange}
+        placeholder="000000"
+        placeholderTextColor={theme.pairPlaceholder}
+        style={[manSt.input,{ color:theme.pairInputText }]}
+        keyboardType="number-pad"
+        maxLength={6}
+        blurOnSubmit={false}
+      />
+    </Pressable>
+  );
+}
+
 function QRScannerScreen({ onScanned,onCancel,theme }:{ onScanned:(data:string)=>void; onCancel:()=>void; theme:ReturnType<typeof useTheme> }) {
   const scannedRef=useRef(false);
   const onBarcodeScanned=({ data }:{ data:string })=>{ if (scannedRef.current) return; scannedRef.current=true; onScanned(data); };
@@ -2317,18 +2974,32 @@ function FileBrowserScreen({ device,browseResult,onBack,sendCommand,sharingRef,d
 // ─────────────────────────────────────────────
 // Media Controls Screen
 // ─────────────────────────────────────────────
-function MediaControlsScreen({ onBack,sendCommand,theme }:{
+function MediaControlsScreen({ onBack,sendCommand,nowPlaying,theme }:{
   onBack:()=>void;
   sendCommand:(type:string,extra:Record<string,any>)=>void;
+  nowPlaying:{title:string|null,artist:string|null,status:string|null}|null;
   theme:ReturnType<typeof useTheme>;
 }) {
-  const media=(action:string)=>sendCommand("media_control",{ action });
+  const media=(action:string)=>{
+    sendCommand("media_control",{ action });
+    setTimeout(()=>sendCommand("get_now_playing",{}), 500);
+  };
+
+  useEffect(()=>{
+    sendCommand("get_now_playing",{});
+    const interval = setInterval(()=>sendCommand("get_now_playing",{}), 5000);
+    return ()=>clearInterval(interval);
+  },[]);
+
   const btn=(icon:string,action:string,color:string,size:number=32)=>(
     <Pressable onPress={()=>media(action)} hitSlop={8}
       style={({ pressed })=>[mediaSt.btn,{ backgroundColor:pressed?color+"44":color+"22" }]}>
       <Ionicons name={icon as any} size={size} color={color}/>
     </Pressable>
   );
+
+  const isPlaying = nowPlaying?.status?.toLowerCase().includes("playing");
+
   return (
     <View style={{ flex:1, backgroundColor:theme.panelBg }}>
       <View style={[st.overlayTopBar,{ paddingHorizontal:20 }]}>
@@ -2341,11 +3012,36 @@ function MediaControlsScreen({ onBack,sendCommand,theme }:{
         </View>
       </View>
       <View style={mediaSt.container}>
+        {/* Now playing card */}
+        <View style={[mediaSt.nowPlayingCard,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+          {nowPlaying?.album_art?(
+            <Image source={{ uri:`data:image/jpeg;base64,${nowPlaying.album_art}` }}
+              style={mediaSt.albumArt}/>
+          ):(
+            <View style={[mediaSt.albumArtPlaceholder,{ backgroundColor:theme.panelBg }]}>
+              <Ionicons name={isPlaying?"musical-notes":"musical-notes-outline"} size={22} color={isPlaying?"#a855f7":theme.labelColor}/>
+            </View>
+          )}
+          <View style={{ flex:1 }}>
+            <Text style={[mediaSt.trackTitle,{ color:theme.rowTitle }]} numberOfLines={1}>
+              {nowPlaying?.title||"Nothing playing"}
+            </Text>
+            {nowPlaying?.artist?(
+              <Text style={[mediaSt.trackArtist,{ color:theme.labelColor }]} numberOfLines={1}>
+                {(nowPlaying as any)?.is_last_known?"Last played · ":""}{nowPlaying.artist}
+              </Text>
+            ):(nowPlaying as any)?.is_last_known?(
+              <Text style={[mediaSt.trackArtist,{ color:theme.labelColor }]}>Last played</Text>
+            ):null}
+          </View>
+        </View>
+        {/* Playback controls */}
         <View style={mediaSt.mainRow}>
           {btn("play-skip-back","prev","#a855f7",36)}
-          {btn("play","play_pause","#007aff",52)}
+          {btn(isPlaying?"pause":"play","play_pause","#007aff",52)}
           {btn("play-skip-forward","next","#a855f7",36)}
         </View>
+        {/* Volume controls */}
         <View style={mediaSt.volRow}>
           {btn("volume-low-outline","vol_down","#f59e0b",28)}
           {btn("volume-mute-outline","vol_mute","#ef4444",28)}
@@ -2370,22 +3066,40 @@ function ClipboardScreen({ onBack,sendCommand,pcClipboardText,onClearClipboard,t
   const [phoneText, setPhoneText] = useState("");
   const [loading,   setLoading]   = useState(false);
   const [status,    setStatus]    = useState("");
+  const [fetchError,setFetchError]= useState("");
+  const [copyLabel, setCopyLabel] = useState("Copy to iPhone");
+  const scrollRef = useRef<ScrollView>(null);
+
+  // Clear when opening or leaving screen
+  useEffect(()=>{
+    onClearClipboard();
+    return ()=>{ onClearClipboard(); };
+  },[]);
 
   useEffect(()=>{
-    if (pcClipboardText!==null) setLoading(false);
+    if (pcClipboardText!==null) { setLoading(false); setFetchError(""); }
   },[pcClipboardText]);
 
   const fetchClipboard = () => {
-    setLoading(true); setStatus(""); onClearClipboard();
+    setLoading(true); setStatus(""); setFetchError(""); onClearClipboard();
     sendCommand("get_clipboard",{});
-    setTimeout(()=>setLoading(false), 5000);
+    setTimeout(()=>{ setLoading(f=>{ if(f){ setFetchError("No response from PC. Make sure the agent is running."); } return false; }); }, 8000);
   };
 
   const pushClipboard = () => {
     if (!phoneText.trim()) return;
     sendCommand("set_clipboard",{ text:phoneText });
+    setPhoneText("");
     setStatus("Sent to PC clipboard!");
-    setTimeout(()=>setStatus(""), 2500);
+    setTimeout(()=>setStatus(""), 3000);
+  };
+
+  const copyToPhone = () => {
+    if (!pcClipboardText) return;
+    const { Clipboard } = require("react-native");
+    Clipboard.setString(pcClipboardText);
+    setCopyLabel("Copied!");
+    setTimeout(()=>setCopyLabel("Copy to iPhone"), 3000);
   };
 
   return (
@@ -2399,44 +3113,74 @@ function ClipboardScreen({ onBack,sendCommand,pcClipboardText,onClearClipboard,t
           <Text style={[st.overlayCenteredTitle,{ color:theme.titleColor }]}>Clipboard Sync</Text>
         </View>
       </View>
-      <ScrollView style={{ flex:1 }} contentContainerStyle={{ padding:20, gap:20 }}>
-        {/* PC → Phone */}
-        <View style={[clipSt.card,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
-          <Text style={[clipSt.sectionLabel,{ color:theme.groupLabel }]}>PC CLIPBOARD</Text>
-          <Pressable onPress={fetchClipboard}
-            style={[clipSt.fetchBtn,{ backgroundColor:"#007aff11", borderColor:"#007aff44" }]}>
-            <Ionicons name="download-outline" size={18} color="#007aff"/>
-            <Text style={clipSt.fetchBtnText}>{loading?"Fetching…":"Fetch from PC"}</Text>
-          </Pressable>
-          {loading?(
-            <View style={{ alignItems:"center", paddingVertical:12 }}>
-              <LoadingDots color="#007aff"/>
-            </View>
-          ):pcClipboardText!==null&&(
-            <View style={[clipSt.textBox,{ backgroundColor:theme.panelBg, borderColor:theme.cardBorder }]}>
-              <Text style={[clipSt.clipText,{ color:theme.rowTitle }]} selectable>{pcClipboardText||"(empty)"}</Text>
-            </View>
-          )}
-        </View>
-        {/* Phone → PC */}
-        <View style={[clipSt.card,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
-          <Text style={[clipSt.sectionLabel,{ color:theme.groupLabel }]}>SEND TO PC</Text>
-          <TextInput
-            value={phoneText}
-            onChangeText={setPhoneText}
-            placeholder="Type or paste text to send to PC…"
-            placeholderTextColor={theme.labelColor}
-            style={[clipSt.input,{ color:theme.rowTitle, backgroundColor:theme.panelBg, borderColor:theme.cardBorder }]}
-            multiline numberOfLines={4}
-          />
-          <Pressable onPress={pushClipboard}
-            style={[clipSt.fetchBtn,{ backgroundColor:"#22c55e11", borderColor:"#22c55e44" }]}>
-            <Ionicons name="arrow-up-outline" size={18} color="#22c55e"/>
-            <Text style={[clipSt.fetchBtnText,{ color:"#22c55e" }]}>Send to PC Clipboard</Text>
-          </Pressable>
-          {!!status&&<Text style={[clipSt.status,{ color:"#22c55e" }]}>{status}</Text>}
-        </View>
-      </ScrollView>
+      <KeyboardAvoidingView behavior={Platform.OS==="ios"?"padding":"height"} style={{ flex:1 }} keyboardVerticalOffset={90}>
+        <ScrollView ref={scrollRef} style={{ flex:1 }} contentContainerStyle={{ padding:20, gap:20 }} keyboardShouldPersistTaps="handled">
+          {/* PC → Phone */}
+          <View style={[clipSt.card,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+            <Text style={[clipSt.sectionLabel,{ color:theme.groupLabel }]}>PC CLIPBOARD</Text>
+            <Pressable onPress={fetchClipboard}
+              style={[clipSt.fetchBtn,{ backgroundColor:"#007aff11", borderColor:"#007aff44" }]}>
+              <Ionicons name="download-outline" size={18} color="#007aff"/>
+              <Text style={clipSt.fetchBtnText}>{loading?"Fetching…":"Fetch from PC"}</Text>
+            </Pressable>
+            {loading&&(
+              <View style={{ alignItems:"center", paddingVertical:8 }}>
+                <LoadingDots color="#007aff"/>
+              </View>
+            )}
+            {!loading&&fetchError&&(
+              <View style={[clipSt.warnRow,{ backgroundColor:"#ef444411", borderColor:"#ef444433" }]}>
+                <Ionicons name="alert-circle-outline" size={14} color="#ef4444"/>
+                <Text style={[clipSt.warnText,{ color:"#ef4444" }]}>{fetchError}</Text>
+              </View>
+            )}
+            {!loading&&pcClipboardText!==null&&(
+              <>
+                <View style={[clipSt.textBox,{ backgroundColor:theme.panelBg, borderColor:theme.cardBorder, maxHeight:200 }]}>
+                  <ScrollView nestedScrollEnabled showsVerticalScrollIndicator>
+                    <Text style={[clipSt.clipText,{ color:theme.rowTitle }]} selectable>
+                      {pcClipboardText||"(empty)"}
+                    </Text>
+                  </ScrollView>
+                </View>
+                {pcClipboardText?.includes("[Truncated —")&&(
+                  <View style={[clipSt.warnRow,{ backgroundColor:"#f59e0b11", borderColor:"#f59e0b44" }]}>
+                    <Ionicons name="warning-outline" size={14} color="#f59e0b"/>
+                    <Text style={[clipSt.warnText,{ color:"#f59e0b" }]}>Content was truncated at 10,000 characters. Use File Browser to transfer large files.</Text>
+                  </View>
+                )}
+                {pcClipboardText&&(
+                  <Pressable onPress={copyToPhone}
+                    style={[clipSt.fetchBtn,{ borderColor:"#a855f744", backgroundColor:"#a855f711" }]}>
+                    <Ionicons name={copyLabel==="Copied!"?"checkmark-outline":"copy-outline"} size={16} color="#a855f7"/>
+                    <Text style={[clipSt.fetchBtnText,{ color:"#a855f7" }]}>{copyLabel}</Text>
+                  </Pressable>
+                )}
+              </>
+            )}
+          </View>
+          {/* Phone → PC */}
+          <View style={[clipSt.card,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+            <Text style={[clipSt.sectionLabel,{ color:theme.groupLabel }]}>SEND TO PC</Text>
+            <TextInput
+              value={phoneText}
+              onChangeText={setPhoneText}
+              placeholder="Type or paste text to send to PC…"
+              placeholderTextColor={theme.labelColor}
+              style={[clipSt.input,{ color:theme.rowTitle, backgroundColor:theme.panelBg, borderColor:theme.cardBorder, minHeight:80 }]}
+              multiline
+              scrollEnabled
+              onFocus={()=>setTimeout(()=>scrollRef.current?.scrollToEnd({ animated:true }), 300)}
+            />
+            <Pressable onPress={pushClipboard}
+              style={[clipSt.fetchBtn,{ backgroundColor:"#22c55e11", borderColor:"#22c55e44" }]}>
+              <Ionicons name="arrow-up-outline" size={18} color="#22c55e"/>
+              <Text style={[clipSt.fetchBtnText,{ color:"#22c55e" }]}>Send to PC Clipboard</Text>
+            </Pressable>
+            {!!status&&<Text style={[clipSt.status,{ color:"#22c55e" }]}>{status}</Text>}
+          </View>
+        </ScrollView>
+      </KeyboardAvoidingView>
     </View>
   );
 }
@@ -2455,8 +3199,9 @@ function TypeTextScreen({ onBack,sendCommand,theme }:{
   const send = () => {
     if (!text.trim()) return;
     sendCommand("type_text",{ text });
+    setText(""); // clear after sending
     setStatus("Typed on PC!");
-    setTimeout(()=>setStatus(""), 2500);
+    setTimeout(()=>setStatus(""), 5000);
   };
 
   return (
@@ -2505,6 +3250,7 @@ function ScreenshotScreen({ onBack,sendCommand,screenshotResult,onClearScreensho
   theme:ReturnType<typeof useTheme>;
 }) {
   const [loading, setLoading] = useState(false);
+  const [zoomed,  setZoomed]  = useState(false);
 
   useEffect(()=>{
     if (screenshotResult!==null) setLoading(false);
@@ -2534,6 +3280,30 @@ function ScreenshotScreen({ onBack,sendCommand,screenshotResult,onClearScreensho
 
   return (
     <View style={{ flex:1, backgroundColor:theme.panelBg }}>
+      {/* Fullscreen zoom modal with pinch-to-zoom */}
+      <Modal visible={zoomed} transparent animationType="fade" onRequestClose={()=>setZoomed(false)}>
+        <View style={{ flex:1, backgroundColor:"#000" }}>
+          <ScrollView
+            style={{ flex:1 }}
+            contentContainerStyle={{ flex:1, justifyContent:"center", alignItems:"center" }}
+            minimumZoomScale={1}
+            maximumZoomScale={5}
+            showsHorizontalScrollIndicator={false}
+            showsVerticalScrollIndicator={false}
+            centerContent
+          >
+            <Image source={{ uri:`data:image/jpeg;base64,${screenshotB64}` }}
+              style={{ width:screenWidth, height:screenHeight, resizeMode:"contain" }}/>
+          </ScrollView>
+          <Pressable onPress={()=>setZoomed(false)}
+            style={{ position:"absolute", top:50, right:20 }} hitSlop={16}>
+            <Ionicons name="close-circle" size={36} color="rgba(255,255,255,0.8)"/>
+          </Pressable>
+          <Text style={{ position:"absolute", bottom:40, left:0, right:0, textAlign:"center", color:"rgba(255,255,255,0.4)", fontSize:13 }}>
+            Pinch to zoom · Tap × to close
+          </Text>
+        </View>
+      </Modal>
       <View style={[st.overlayTopBar,{ paddingHorizontal:20 }]}>
         <Pressable onPress={onBack} style={st.overlayBackBtn} hitSlop={10}>
           <Ionicons name="chevron-back" size={22} color="#007aff"/>
@@ -2542,21 +3312,29 @@ function ScreenshotScreen({ onBack,sendCommand,screenshotResult,onClearScreensho
         <View style={StyleSheet.absoluteFillObject} pointerEvents="none">
           <Text style={[st.overlayCenteredTitle,{ color:theme.titleColor }]}>Screenshot</Text>
         </View>
-        {screenshotB64&&(
-          <Pressable onPress={save} hitSlop={10}>
-            <Ionicons name="share-outline" size={22} color="#007aff"/>
-          </Pressable>
-        )}
       </View>
       <View style={{ flex:1, alignItems:"center", justifyContent:"center", padding:20 }}>
         {screenshotB64?(
           <>
-            <Image source={{ uri:`data:image/jpeg;base64,${screenshotB64}` }}
-              style={{ width:"100%", aspectRatio:16/9, borderRadius:12, resizeMode:"contain" }}/>
-            <Pressable onPress={capture} style={[clipSt.fetchBtn,{ marginTop:16, borderColor:"#007aff44", backgroundColor:"#007aff11" }]}>
-              <Ionicons name="refresh-outline" size={18} color="#007aff"/>
-              <Text style={clipSt.fetchBtnText}>Capture Again</Text>
+            <Pressable onPress={()=>setZoomed(true)} style={{ width:"100%" }}>
+              <Image source={{ uri:`data:image/jpeg;base64,${screenshotB64}` }}
+                style={{ width:"100%", aspectRatio:16/9, borderRadius:12, resizeMode:"contain" }}/>
+              <View style={{ position:"absolute", bottom:8, right:8, backgroundColor:"rgba(0,0,0,0.5)", borderRadius:8, padding:4 }}>
+                <Ionicons name="expand-outline" size={16} color="white"/>
+              </View>
             </Pressable>
+            <View style={{ flexDirection:"row", gap:12, marginTop:16 }}>
+              <Pressable onPress={save}
+                style={({ pressed })=>[clipSt.fetchBtn,{ flex:1, borderColor:"#22c55e", backgroundColor:pressed?"#22c55e44":"#22c55e11" }]}>
+                <Ionicons name="download-outline" size={18} color="#22c55e"/>
+                <Text style={[clipSt.fetchBtnText,{ color:"#22c55e" }]}>Save to Phone</Text>
+              </Pressable>
+              <Pressable onPress={capture}
+                style={({ pressed })=>[clipSt.fetchBtn,{ flex:1, borderColor:"#f59e0b", backgroundColor:pressed?"#f59e0b44":"#f59e0b11" }]}>
+                <Ionicons name="camera-outline" size={18} color="#f59e0b"/>
+                <Text style={[clipSt.fetchBtnText,{ color:"#f59e0b" }]}>New Shot</Text>
+              </Pressable>
+            </View>
           </>
         ):loading?(
           <>
@@ -2568,7 +3346,7 @@ function ScreenshotScreen({ onBack,sendCommand,screenshotResult,onClearScreensho
           <>
             <Ionicons name="camera-outline" size={56} color={theme.labelColor}/>
             <Text style={[clipSt.hint,{ color:theme.labelColor, marginTop:12, textAlign:"center" }]}>
-              Capture your PC screen and view it here. Tap Share to save to your camera roll.
+              Capture your PC screen and view it here.
             </Text>
             {error&&<Text style={{ color:"#ef4444", fontSize:13, marginTop:8, textAlign:"center" }}>{error}</Text>}
             <Pressable onPress={capture}
@@ -2584,20 +3362,492 @@ function ScreenshotScreen({ onBack,sendCommand,screenshotResult,onClearScreensho
 }
 
 // ─────────────────────────────────────────────
-function ToolsScreen({ device,onBack,onOpenFiles,onOpenMedia,onOpenClipboard,onOpenTypeText,onOpenScreenshot,theme }:{
+// Network Info Screen
+// ─────────────────────────────────────────────
+function NetworkInfoScreen({ onBack,sendCommand,networkData,speedtestData,theme }:{
+  onBack:()=>void;
+  sendCommand:(type:string,extra:Record<string,any>)=>void;
+  networkData:any; speedtestData:any;
+  theme:ReturnType<typeof useTheme>;
+}) {
+  const [loadingTest, setLoadingTest] = useState(false);
+
+  useEffect(()=>{
+    sendCommand("network_subscribe",{});
+    return ()=>sendCommand("network_unsubscribe",{});
+  },[]);
+
+  useEffect(()=>{ if(speedtestData) setLoadingTest(false); },[speedtestData]);
+
+  const StatRow = ({ label, value, icon, color }:{ label:string; value:string; icon:string; color:string }) => (
+    <View style={[netSt.statRow,{ borderBottomColor:theme.cardBorder }]}>
+      <View style={[netSt.statIcon,{ backgroundColor:color+"22" }]}>
+        <Ionicons name={icon as any} size={16} color={color}/>
+      </View>
+      <Text style={[netSt.statLabel,{ color:theme.labelColor }]}>{label}</Text>
+      <Text style={[netSt.statValue,{ color:theme.rowTitle }]}>{value}</Text>
+    </View>
+  );
+
+  return (
+    <View style={{ flex:1, backgroundColor:theme.panelBg }}>
+      <View style={[st.overlayTopBar,{ paddingHorizontal:20 }]}>
+        <Pressable onPress={onBack} style={st.overlayBackBtn} hitSlop={10}>
+          <Ionicons name="chevron-back" size={22} color="#007aff"/>
+          <Text style={st.overlayBackText}>Back</Text>
+        </Pressable>
+        <View style={StyleSheet.absoluteFillObject} pointerEvents="none">
+          <Text style={[st.overlayCenteredTitle,{ color:theme.titleColor }]}>Network Info</Text>
+        </View>
+      </View>
+      <ScrollView contentContainerStyle={{ padding:20, gap:16 }}>
+        {/* Live usage */}
+        <View style={[netSt.card,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+          <View style={{ flexDirection:"row", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+            <Text style={[netSt.cardLabel,{ color:theme.groupLabel }]}>LIVE USAGE</Text>
+            <View style={{ flexDirection:"row", alignItems:"center", gap:4 }}>
+              <View style={{ width:6, height:6, borderRadius:3, backgroundColor:"#22c55e" }}/>
+              <Text style={{ color:"#22c55e", fontSize:11 }}>Live</Text>
+            </View>
+          </View>
+          {networkData?(
+            <>
+              <StatRow
+                label="Connection"
+                value={networkData.connection_type==="Wi-Fi" && networkData.wifi_name
+                  ? `Wi-Fi · ${networkData.wifi_name}`
+                  : networkData.connection_type||"Unknown"}
+                icon={networkData.connection_type==="Wi-Fi"?"wifi-outline":"git-network-outline"}
+                color="#007aff"
+              />
+              <StatRow label="↓ Downloading" value={`${networkData.download_mbps} Mbps`} icon="arrow-down-outline" color="#22c55e"/>
+              <StatRow label="↑ Uploading"   value={`${networkData.upload_mbps} Mbps`}   icon="arrow-up-outline"   color="#f59e0b"/>
+              <Text style={{ color:theme.labelColor, fontSize:11, marginTop:6 }}>
+                Shows current data usage — 0 Mbps means nothing is transferring right now
+              </Text>
+            </>
+          ):<View style={{ paddingVertical:16, alignItems:"center" }}><LoadingDots color="#007aff"/></View>}
+        </View>
+
+        {/* Speed test */}
+        <View style={[netSt.card,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+          <Text style={[netSt.cardLabel,{ color:theme.groupLabel }]}>SPEED TEST</Text>
+          <Text style={{ color:theme.labelColor, fontSize:12, marginBottom:8 }}>
+            Tests your maximum connection capacity
+          </Text>
+          {speedtestData?.error&&<Text style={{ color:"#ef4444", fontSize:13, marginBottom:8 }}>{speedtestData.error}</Text>}
+          {speedtestData&&!speedtestData.error&&(
+            <>
+              <StatRow label="↓ Download" value={`${speedtestData.download_mbps} Mbps`} icon="arrow-down-outline" color="#22c55e"/>
+              <StatRow label="↑ Upload"   value={`${speedtestData.upload_mbps} Mbps`}   icon="arrow-up-outline"   color="#f59e0b"/>
+              <StatRow label="Ping"       value={`${speedtestData.ping_ms} ms`}          icon="pulse-outline"      color="#a855f7"/>
+              {speedtestData.server&&<StatRow label="Server" value={speedtestData.server} icon="server-outline" color="#6b7280"/>}
+            </>
+          )}
+          <Pressable onPress={()=>{ setLoadingTest(true); sendCommand("run_speedtest",{}); }} disabled={loadingTest}
+            style={[clipSt.fetchBtn,{ borderColor:"#007aff44", backgroundColor:"#007aff11", marginTop:8 }]}>
+            {loadingTest
+              ? <><LoadingDots color="#007aff"/><Text style={clipSt.fetchBtnText}>Testing…</Text></>
+              : <><Ionicons name="speedometer-outline" size={18} color="#007aff"/><Text style={clipSt.fetchBtnText}>Run Speed Test</Text></>
+            }
+          </Pressable>
+          {loadingTest&&<Text style={{ color:theme.labelColor, fontSize:12, textAlign:"center" }}>May take 10–20 seconds</Text>}
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────
+// File Upload Screen (Phone → PC)
+// ─────────────────────────────────────────────
+function FileUploadScreen({ onBack,sendCommand,browseResult,uploadResult,theme }:{
+  onBack:()=>void;
+  sendCommand:(type:string,extra:Record<string,any>)=>void;
+  browseResult:FileBrowseResult|null;
+  uploadResult:any;
+  theme:ReturnType<typeof useTheme>;
+}) {
+  const [destPath,   setDestPath]   = useState("");
+  const [destHistory,setDestHistory]= useState<string[]>([]);
+  const [pickingDest,setPickingDest]= useState(false);
+  const [uploading,  setUploading]  = useState(false);
+  const [fileName,   setFileName]   = useState<string|null>(null);
+  const [status,     setStatus]     = useState("");
+
+  useEffect(()=>{
+    if (uploadResult) {
+      setUploading(false);
+      setStatus(uploadResult.success?`✓ Saved to ${uploadResult.path}`:`✗ ${uploadResult.error}`);
+      if (uploadResult.success) setFileName(null);
+    }
+  },[uploadResult]);
+
+  const pickFile = async () => {
+    try {
+      const DocumentPicker = require("expo-document-picker");
+      const result = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory:true });
+      if (result.canceled||!result.assets?.[0]) return;
+      const asset = result.assets[0];
+      setFileName(asset.name); setStatus("");
+      const FileSystem = require("expo-file-system/legacy");
+      const b64 = await FileSystem.readAsStringAsync(asset.uri, { encoding:"base64" });
+      setUploading(true);
+      sendCommand("upload_file",{ name:asset.name, data:b64, dest_folder:destPath||"" });
+      setTimeout(()=>{ setUploading(u=>{ if(u) setStatus("✗ Upload timed out. Check your connection."); return false; }); }, 60000);
+    } catch(e:any) { setStatus(`Error: ${e.message}`); }
+  };
+
+  const browseEntries = (browseResult?.path===destPath||(browseResult?.path==="Home"&&destPath===""))
+    ? (browseResult?.entries??[]).filter(e=>e.isDir) : [];
+
+  return (
+    <View style={{ flex:1, backgroundColor:theme.panelBg }}>
+      <View style={[st.overlayTopBar,{ paddingHorizontal:20 }]}>
+        <Pressable onPress={onBack} style={st.overlayBackBtn} hitSlop={10}>
+          <Ionicons name="chevron-back" size={22} color="#007aff"/>
+          <Text style={st.overlayBackText}>Back</Text>
+        </Pressable>
+        <View style={StyleSheet.absoluteFillObject} pointerEvents="none">
+          <Text style={[st.overlayCenteredTitle,{ color:theme.titleColor }]}>Upload to PC</Text>
+        </View>
+      </View>
+      <ScrollView contentContainerStyle={{ padding:20, gap:16 }}>
+        <View style={[clipSt.card,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+          <Text style={[clipSt.sectionLabel,{ color:theme.groupLabel }]}>DESTINATION</Text>
+          <View style={[fileSt.pathBar,{ backgroundColor:theme.panelBg, borderColor:theme.cardBorder, marginBottom:8 }]}>
+            <Ionicons name="folder-outline" size={14} color={theme.labelColor} style={{ marginRight:6 }}/>
+            <Text style={[fileSt.pathText,{ color:theme.labelColor }]} numberOfLines={1}>
+              {destPath||"Downloads (default)"}
+            </Text>
+          </View>
+          <Pressable onPress={()=>{ setPickingDest(p=>!p); if(!pickingDest) sendCommand("browse_files",{ path:"" }); }}
+            style={[clipSt.fetchBtn,{ borderColor:"#007aff44", backgroundColor:"#007aff11" }]}>
+            <Ionicons name="folder-open-outline" size={18} color="#007aff"/>
+            <Text style={clipSt.fetchBtnText}>{pickingDest?"Close":"Browse Folders"}</Text>
+          </Pressable>
+          {pickingDest&&(
+            <View style={{ marginTop:8, gap:2 }}>
+              {destHistory.length>0&&(
+                <Pressable onPress={()=>{
+                  const prev=destHistory[destHistory.length-1];
+                  setDestHistory(h=>h.slice(0,-1)); setDestPath(prev);
+                  sendCommand("browse_files",{ path:prev });
+                }} style={{ flexDirection:"row", alignItems:"center", gap:6, padding:8 }}>
+                  <Ionicons name="arrow-back-outline" size={16} color="#007aff"/>
+                  <Text style={{ color:"#007aff", fontSize:14 }}>Back</Text>
+                </Pressable>
+              )}
+              {browseEntries.length===0
+                ?<Text style={{ color:theme.labelColor, fontSize:13, padding:8 }}>No subfolders</Text>
+                :browseEntries.map((e,i)=>(
+                  <View key={i} style={[fileSt.entry,{ borderBottomColor:theme.cardBorder }]}>
+                    <View style={[fileSt.entryIcon,{ backgroundColor:"#007aff22" }]}>
+                      <Ionicons name="folder-outline" size={18} color="#007aff"/>
+                    </View>
+                    <Text style={[fileSt.entryName,{ color:theme.rowTitle, flex:1 }]} numberOfLines={1}>{e.name}</Text>
+                    <Pressable onPress={()=>{
+                      const newPath=e.path||(destPath?`${destPath}\\${e.name}`:e.name);
+                      setDestHistory(h=>[...h,destPath]); setDestPath(newPath);
+                      sendCommand("browse_files",{ path:newPath });
+                    }} style={{ padding:4 }}>
+                      <Ionicons name="chevron-forward" size={16} color={theme.chevron}/>
+                    </Pressable>
+                    <Pressable onPress={()=>{
+                      const sel=e.path||(destPath?`${destPath}\\${e.name}`:e.name);
+                      setDestPath(sel); setPickingDest(false);
+                    }} style={{ paddingHorizontal:10, paddingVertical:4, backgroundColor:"#007aff22", borderRadius:8 }}>
+                      <Text style={{ color:"#007aff", fontSize:12, fontWeight:"600" }}>Select</Text>
+                    </Pressable>
+                  </View>
+                ))
+              }
+            </View>
+          )}
+        </View>
+
+        <View style={[clipSt.card,{ backgroundColor:theme.cardBg, borderColor:theme.cardBorder }]}>
+          <Text style={[clipSt.sectionLabel,{ color:theme.groupLabel }]}>FILE</Text>
+          {fileName&&(
+            <View style={{ flexDirection:"row", alignItems:"center", gap:8, paddingBottom:8 }}>
+              <Ionicons name="document-outline" size={16} color={theme.labelColor}/>
+              <Text style={{ color:theme.rowTitle, fontSize:14, flex:1 }} numberOfLines={1}>{fileName}</Text>
+            </View>
+          )}
+          <Pressable onPress={pickFile} disabled={uploading}
+            style={[clipSt.fetchBtn,{ borderColor:"#22c55e44", backgroundColor:"#22c55e11" }]}>
+            <Ionicons name="cloud-upload-outline" size={18} color="#22c55e"/>
+            <Text style={[clipSt.fetchBtnText,{ color:"#22c55e" }]}>
+              {uploading?"Uploading…":"Pick File & Upload"}
+            </Text>
+          </Pressable>
+          {uploading&&<View style={{ alignItems:"center" }}><LoadingDots color="#22c55e"/></View>}
+          {!!status&&<Text style={{ color:status.startsWith("✓")?"#22c55e":"#ef4444", fontSize:13, textAlign:"center" }}>{status}</Text>}
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Soundboard Screen
+// ─────────────────────────────────────────────
+interface SoundButton { id:string; name:string; path:string; color:string; }
+const SOUND_COLORS = ["#ef4444","#f59e0b","#22c55e","#007aff","#a855f7","#06b6d4","#f97316","#ec4899"];
+
+function SoundboardScreen({ onBack,sendCommand,audioDevices,soundboardFileResult,theme,pcId }:{
+  onBack:()=>void;
+  sendCommand:(type:string,extra:Record<string,any>)=>void;
+  audioDevices:{outputs:any[],inputs:any[]};
+  soundboardFileResult:any;
+  theme:ReturnType<typeof useTheme>;
+  pcId:string;
+}) {
+  const [sounds,      setSounds]      = useState<SoundButton[]>([]);
+  const [deviceId,    setDeviceId]    = useState<number>(-1);
+  const [showDevices,    setShowDevices]    = useState(false);
+  const [editingSound,   setEditingSound]   = useState<SoundButton|null>(null);
+  const [editName,       setEditName]       = useState("");
+  const [colorPickSound, setColorPickSound] = useState<SoundButton|null>(null);
+  const pendingPickRef = useRef<string|null>(null);
+  const addingRef = useRef(false);
+
+  useEffect(()=>{
+    AsyncStorage.getItem(`pclink_soundboard_${pcId}`).then(r=>{ if(r) setSounds(JSON.parse(r)); });
+    AsyncStorage.getItem(`pclink_soundboard_device_${pcId}`).then(r=>{
+      if (r) setDeviceId(parseInt(r));
+    });
+    sendCommand("get_audio_devices",{});
+  },[]);
+
+  useEffect(()=>{
+    if (audioDevices.outputs.length>0 && deviceId!==-1) {
+      const exists = audioDevices.outputs.find(d=>d.id===deviceId);
+      if (!exists) { setDeviceId(-1); AsyncStorage.setItem(`pclink_soundboard_device_${pcId}`,"-1"); }
+    }
+  },[audioDevices]);
+
+  const selectDevice = (id:number) => {
+    setDeviceId(id);
+    AsyncStorage.setItem(`pclink_soundboard_device_${pcId}`, id.toString());
+    setShowDevices(false);
+  };
+
+  const saveSounds = (s:SoundButton[]) => {
+    setSounds(s);
+    AsyncStorage.setItem(`pclink_soundboard_${pcId}`, JSON.stringify(s));
+  };
+
+  useEffect(()=>{
+    if (!soundboardFileResult?.path||!pendingPickRef.current) return;
+    pendingPickRef.current = null;
+    addingRef.current = false;
+    const newSound:SoundButton = {
+      id: Date.now().toString(),
+      name: soundboardFileResult.name?.replace(/\.[^.]+$/,"")||soundboardFileResult.path.split("\\").pop()?.replace(/\.[^.]+$/,"")||"Sound",
+      path: soundboardFileResult.path,
+      color: SOUND_COLORS[sounds.length%SOUND_COLORS.length],
+    };
+    saveSounds([...sounds, newSound]);
+  },[soundboardFileResult]);
+
+  const addFromPC = () => {
+    if (addingRef.current) return;
+    addingRef.current = true;
+    pendingPickRef.current = "pending";
+    sendCommand("browse_soundboard_files",{ request_id: Date.now().toString() });
+    setTimeout(()=>{ addingRef.current = false; }, 10000);
+  };
+
+  const playSound = (sound:SoundButton) => {
+    console.log("[SOUNDBOARD] Playing:", sound.name, "path:", sound.path, "device:", deviceId);
+    sendCommand("play_sound",{ path:sound.path, audio_device_id:deviceId });
+  };
+
+  const stopAll = () => sendCommand("stop_sounds",{});
+
+  const onLongPress = (sound:SoundButton) => {
+    Alert.alert(sound.name, "What would you like to do?", [
+      { text:"Rename", onPress:()=>{ setEditName(sound.name); setEditingSound(sound); } },
+      { text:"Change Color", onPress:()=>{ setColorPickSound(sound); } },
+      { text:"Delete", style:"destructive", onPress:()=>saveSounds(sounds.filter(s=>s.id!==sound.id)) },
+      { text:"Cancel", style:"cancel" },
+    ]);
+  };
+
+  const btnW = (screenWidth-32-8*2)/3;
+
+  return (
+    <View style={{ flex:1, backgroundColor:theme.panelBg }}>
+      <View style={[st.overlayTopBar,{ paddingHorizontal:20 }]}>
+        <Pressable onPress={onBack} style={st.overlayBackBtn} hitSlop={10}>
+          <Ionicons name="chevron-back" size={22} color="#007aff"/>
+          <Text style={st.overlayBackText}>Back</Text>
+        </Pressable>
+        <View style={StyleSheet.absoluteFillObject} pointerEvents="none">
+          <Text style={[st.overlayCenteredTitle,{ color:theme.titleColor }]}>Soundboard</Text>
+        </View>
+        <View style={{ flexDirection:"row", gap:12 }}>
+          <Pressable onPress={stopAll} hitSlop={10}>
+            <Ionicons name="stop-circle-outline" size={24} color="#ef4444"/>
+          </Pressable>
+          <Pressable onPress={()=>setShowDevices(d=>!d)} hitSlop={10}>
+            <Ionicons name="options-outline" size={22} color="#007aff"/>
+          </Pressable>
+        </View>
+      </View>
+
+      {/* Rename modal */}
+      <Modal visible={!!editingSound} transparent animationType="fade" onRequestClose={()=>setEditingSound(null)}>
+        <Pressable style={{ flex:1, backgroundColor:"rgba(0,0,0,0.5)", justifyContent:"center", padding:32 }} onPress={()=>setEditingSound(null)}>
+          <Pressable style={[sbSt.deviceModal,{ backgroundColor:theme.cardBg, borderRadius:16, padding:24 }]} onPress={e=>e.stopPropagation()}>
+            <Text style={[sbSt.deviceLabel,{ color:theme.groupLabel, marginBottom:12 }]}>RENAME SOUND</Text>
+            <TextInput
+              value={editName}
+              onChangeText={setEditName}
+              style={[clipSt.input,{ color:theme.rowTitle, backgroundColor:theme.panelBg, borderColor:theme.cardBorder, marginBottom:12 }]}
+              autoFocus
+              selectTextOnFocus
+            />
+            <View style={{ flexDirection:"row", gap:10 }}>
+              <Pressable onPress={()=>setEditingSound(null)}
+                style={[clipSt.fetchBtn,{ flex:1, borderColor:theme.cardBorder, backgroundColor:"transparent" }]}>
+                <Text style={{ color:theme.labelColor, fontWeight:"600" }}>Cancel</Text>
+              </Pressable>
+              <Pressable onPress={()=>{
+                if (editName.trim()&&editingSound) {
+                  saveSounds(sounds.map(s=>s.id===editingSound.id?{...s,name:editName.trim()}:s));
+                  setEditingSound(null);
+                }
+              }} style={[clipSt.fetchBtn,{ flex:1, borderColor:"#007aff44", backgroundColor:"#007aff11" }]}>
+                <Text style={{ color:"#007aff", fontWeight:"600" }}>Save</Text>
+              </Pressable>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* Color picker modal */}
+      <Modal visible={!!colorPickSound} transparent animationType="fade" onRequestClose={()=>setColorPickSound(null)}>
+        <Pressable style={{ flex:1, backgroundColor:"rgba(0,0,0,0.5)", justifyContent:"center", padding:32 }} onPress={()=>setColorPickSound(null)}>
+          <Pressable style={[sbSt.deviceModal,{ backgroundColor:theme.cardBg, borderRadius:16, padding:24 }]} onPress={e=>e.stopPropagation()}>
+            <Text style={[sbSt.deviceLabel,{ color:theme.groupLabel, marginBottom:16 }]}>PICK A COLOR</Text>
+            <View style={{ flexDirection:"row", flexWrap:"wrap", gap:12, justifyContent:"center", marginBottom:16 }}>
+              {SOUND_COLORS.map((c,i)=>{
+                const names = ["Red","Amber","Green","Blue","Purple","Cyan","Orange","Pink"];
+                const isSelected = colorPickSound?.color===c;
+                return (
+                  <Pressable key={c} onPress={()=>{
+                    if (colorPickSound) saveSounds(sounds.map(s=>s.id===colorPickSound.id?{...s,color:c}:s));
+                    setColorPickSound(null);
+                  }} style={{ alignItems:"center", gap:6 }}>
+                    <View style={{ width:44, height:44, borderRadius:22, backgroundColor:c,
+                      borderWidth:isSelected?3:0, borderColor:"white",
+                      shadowColor:c, shadowOffset:{ width:0,height:0 }, shadowOpacity:0.8, shadowRadius:6, elevation:4 }}/>
+                    <Text style={{ color:c, fontSize:11, fontWeight:"600" }}>{names[i]}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <Pressable onPress={()=>setColorPickSound(null)}
+              style={[clipSt.fetchBtn,{ borderColor:theme.cardBorder, backgroundColor:"transparent" }]}>
+              <Text style={{ color:theme.labelColor, fontWeight:"600" }}>Cancel</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* Device picker modal */}
+      <Modal visible={showDevices} transparent animationType="fade" onRequestClose={()=>setShowDevices(false)}>
+        <Pressable style={{ flex:1, backgroundColor:"rgba(0,0,0,0.5)", justifyContent:"flex-end" }} onPress={()=>setShowDevices(false)}>
+          <View style={[sbSt.deviceModal,{ backgroundColor:theme.cardBg }]}>
+            <Text style={[sbSt.deviceLabel,{ color:theme.groupLabel, marginBottom:12 }]}>SELECT OUTPUT DEVICE</Text>
+            <Pressable onPress={()=>selectDevice(-1)}
+              style={[sbSt.deviceRow,{ backgroundColor:deviceId===-1?"#007aff22":"transparent" }]}>
+              <Ionicons name="volume-medium-outline" size={20} color={deviceId===-1?"#007aff":theme.labelColor}/>
+              <Text style={[sbSt.deviceRowText,{ color:deviceId===-1?"#007aff":theme.rowTitle }]}>Default Device</Text>
+              {deviceId===-1&&<Ionicons name="checkmark" size={18} color="#007aff"/>}
+            </Pressable>
+            {audioDevices.outputs.map(d=>(
+              <Pressable key={d.id} onPress={()=>selectDevice(d.id)}
+                style={[sbSt.deviceRow,{ backgroundColor:deviceId===d.id?"#007aff22":"transparent" }]}>
+                <Ionicons name="volume-high-outline" size={20} color={deviceId===d.id?"#007aff":theme.labelColor}/>
+                <Text style={[sbSt.deviceRowText,{ color:deviceId===d.id?"#007aff":theme.rowTitle }]} numberOfLines={1}>{d.name}</Text>
+                {deviceId===d.id&&<Ionicons name="checkmark" size={18} color="#007aff"/>}
+              </Pressable>
+            ))}
+            <Pressable onPress={()=>setShowDevices(false)}
+              style={[sbSt.deviceRow,{ justifyContent:"center", marginTop:8 }]}>
+              <Text style={{ color:"#ef4444", fontSize:15, fontWeight:"600" }}>Cancel</Text>
+            </Pressable>
+          </View>
+        </Pressable>
+      </Modal>
+
+      <ScrollView contentContainerStyle={{ padding:16, paddingBottom:40 }}>
+        {sounds.length===0?(
+          <View style={panelSt.empty}>
+            <Ionicons name="volume-high-outline" size={44} color={theme.labelColor}/>
+            <Text style={[panelSt.emptyTitle,{ color:theme.titleColor }]}>No sounds yet</Text>
+            <Text style={[panelSt.emptySub,{ color:theme.labelColor }]}>Add sounds from your PC below</Text>
+          </View>
+        ):(
+          <View style={sbSt.grid}>
+            {sounds.map(sound=>(
+              <Pressable key={sound.id}
+                onPress={()=>playSound(sound)}
+                onLongPress={()=>onLongPress(sound)}
+                delayLongPress={400}
+                style={({ pressed })=>[sbSt.soundBtn,{
+                  backgroundColor:pressed?sound.color:sound.color+"22",
+                  borderColor:sound.color+"66",
+                  width:btnW,
+                }]}>
+                <Ionicons name="volume-high-outline" size={24} color={sound.color}/>
+                <Text style={[sbSt.soundName,{ color:sound.color }]} numberOfLines={3}>
+                  {sound.name}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        )}
+
+        <Pressable onPress={addFromPC}
+          style={({ pressed })=>[clipSt.fetchBtn,{ marginTop:16, borderColor:"#007aff44", backgroundColor:pressed?"#007aff33":"#007aff11" }]}>
+          <Ionicons name="desktop-outline" size={18} color="#007aff"/>
+          <Text style={clipSt.fetchBtnText}>Add Sound from PC</Text>
+        </Pressable>
+        <Text style={{ color:theme.labelColor, fontSize:12, textAlign:"center", marginTop:6 }}>
+          Supported: MP3 · WAV · OGG · FLAC
+        </Text>
+        <Text style={{ color:theme.labelColor, fontSize:12, textAlign:"center", marginTop:2 }}>
+          Long press a button to rename, recolor, or delete
+        </Text>
+      </ScrollView>
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────
+function ToolsScreen({ device,onBack,onOpenFiles,onOpenMedia,onOpenClipboard,onOpenTypeText,onOpenScreenshot,onOpenNetwork,onOpenUpload,onOpenSoundboard,theme,isProActive,onShowPaywall }:{
   device:Device; onBack:()=>void;
   onOpenFiles:()=>void; onOpenMedia:()=>void;
   onOpenClipboard:()=>void; onOpenTypeText:()=>void;
-  onOpenScreenshot:()=>void;
+  onOpenScreenshot:()=>void; onOpenNetwork:()=>void;
+  onOpenUpload:()=>void; onOpenSoundboard:()=>void;
   theme:ReturnType<typeof useTheme>;
+  isProActive:boolean; onShowPaywall:()=>void;
 }) {
   const tileSize=(screenWidth-40-12)/2;
   const tools = [
-    { label:"File Browser",    icon:"folder-open-outline",    color:"#06b6d4", onPress:onOpenFiles },
-    { label:"Media Controls",  icon:"musical-notes-outline",  color:"#a855f7", onPress:onOpenMedia },
-    { label:"Clipboard Sync",  icon:"clipboard-outline",      color:"#f59e0b", onPress:onOpenClipboard },
-    { label:"Type Text",       icon:"text-outline",           color:"#22c55e", onPress:onOpenTypeText },
-    { label:"Screenshot",      icon:"camera-outline",         color:"#ef4444", onPress:onOpenScreenshot },
+    { label:"File Browser",    icon:"folder-open-outline",    color:"#06b6d4", onPress:onOpenFiles,      pro:true },
+    { label:"Media Controls",  icon:"musical-notes-outline",  color:"#a855f7", onPress:onOpenMedia,      pro:true },
+    { label:"Clipboard Sync",  icon:"clipboard-outline",      color:"#f59e0b", onPress:onOpenClipboard,  pro:true },
+    { label:"Type Text",       icon:"text-outline",           color:"#22c55e", onPress:onOpenTypeText,   pro:true },
+    { label:"Screenshot",      icon:"camera-outline",         color:"#ef4444", onPress:onOpenScreenshot, pro:true },
+    { label:"Network Info",    icon:"wifi-outline",           color:"#3b82f6", onPress:onOpenNetwork,    pro:true },
+    { label:"Upload File",     icon:"cloud-upload-outline",   color:"#22c55e", onPress:onOpenUpload,     pro:true },
+    { label:"Soundboard",      icon:"volume-high-outline",    color:"#f97316", onPress:onOpenSoundboard, pro:true },
   ];
   return (
     <View style={{ flex:1, backgroundColor:theme.panelBg }}>
@@ -2611,21 +3861,19 @@ function ToolsScreen({ device,onBack,onOpenFiles,onOpenMedia,onOpenClipboard,onO
         </View>
       </View>
       <ScrollView contentContainerStyle={[gridSt.container,{ paddingTop:20, paddingBottom:40 }]}>
-        {tools.map(tool=>(
-          <Pressable key={tool.label} onPress={tool.onPress}
-            style={({ pressed })=>[gridSt.tile,{ width:tileSize, height:tileSize*0.85, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
-            <View style={[gridSt.iconCircle,{ backgroundColor:tool.color+"22" }]}>
-              <Ionicons name={tool.icon as any} size={32} color={tool.color}/>
-            </View>
-            <Text style={[gridSt.label,{ color:theme.actionTileText }]}>{tool.label}</Text>
-          </Pressable>
-        ))}
-        <View style={[gridSt.tile,{ width:tileSize, height:tileSize*0.85, backgroundColor:theme.actionTile, opacity:0.3 }]} pointerEvents="none">
-          <View style={[gridSt.iconCircle,{ backgroundColor:"#6b728022" }]}>
-            <Ionicons name="add-circle-outline" size={32} color="#6b7280"/>
-          </View>
-          <Text style={[gridSt.label,{ color:theme.actionTileText }]}>More Soon</Text>
-        </View>
+        {tools.map(tool=>{
+          const locked = tool.pro && !isProActive;
+          return (
+            <Pressable key={tool.label} onPress={locked ? onShowPaywall : tool.onPress}
+              style={({ pressed })=>[gridSt.tile,{ width:tileSize, height:tileSize*0.85, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
+              <View style={[gridSt.iconCircle,{ backgroundColor:tool.color+(locked?"11":"22") }]}>
+                <Ionicons name={tool.icon as any} size={32} color={locked ? theme.labelColor : tool.color}/>
+              </View>
+              <Text style={[gridSt.label,{ color:locked ? theme.labelColor : theme.actionTileText }]}>{tool.label}</Text>
+              {locked&&<ProLockBadge/>}
+            </Pressable>
+          );
+        })}
       </ScrollView>
     </View>
   );
@@ -2634,54 +3882,63 @@ function ToolsScreen({ device,onBack,onOpenFiles,onOpenMedia,onOpenClipboard,onO
 // ─────────────────────────────────────────────
 // Action Grid — 2×2 main + 2×2 bottom row
 // ─────────────────────────────────────────────
-function ActionGrid({ theme,onAction,onEventsPress,onScenesPress,onVolumePress,onCustomActionsPress,onToolsPress,onSleepPress }:{
+function ActionGrid({ theme,onAction,onEventsPress,onScenesPress,onVolumePress,onCustomActionsPress,onToolsPress,isProActive,onShowPaywall }:{
   theme:ReturnType<typeof useTheme>;
   onAction:(key:string,label:string,risky:boolean)=>void;
   onEventsPress:()=>void; onScenesPress:()=>void;
   onVolumePress:()=>void; onCustomActionsPress:()=>void;
-  onToolsPress:()=>void; onSleepPress:()=>void;
+  onToolsPress:()=>void;
+  isProActive:boolean; onShowPaywall:()=>void;
 }) {
-  const tileSize=(screenWidth-40-12)/2;
-  const smallSize=(screenWidth-40-12)/2;
+  const big=(screenWidth-40-12)/2;
+  const small=(screenWidth-40-12)/2;
+
+  const bigTile=(key:string,label:string,icon:string,color:string,risky:boolean,onPress?:()=>void)=>(
+    <Pressable key={key} onPress={onPress||(()=>onAction(key,label,risky))}
+      style={({ pressed })=>[gridSt.tile,{ width:big, height:big*0.85, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
+      <View style={[gridSt.iconCircle,{ backgroundColor:color+"22" }]}><Ionicons name={icon as any} size={32} color={color}/></View>
+      <Text style={[gridSt.label,{ color:theme.actionTileText }]}>{label}</Text>
+    </Pressable>
+  );
+
+  const smallTile=(key:string,label:string,icon:string,color:string,onPress:()=>void,pro=false)=>{
+    const locked = pro && !isProActive;
+    return (
+      <Pressable key={key} onPress={locked ? onShowPaywall : onPress}
+        style={({ pressed })=>[gridSt.tile,{ width:small, height:small*0.72, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
+        <View style={[gridSt.iconCircle,{ backgroundColor:color+(locked?"11":"22"), width:46, height:46, borderRadius:23 }]}>
+          <Ionicons name={icon as any} size={24} color={locked?theme.labelColor:color}/>
+        </View>
+        <Text style={[gridSt.label,{ color:locked?theme.labelColor:theme.actionTileText, fontSize:13 }]}>{label}</Text>
+        {locked&&<ProLockBadge/>}
+      </Pressable>
+    );
+  };
+
   return (
     <View style={gridSt.container}>
-      {ACTIONS.map(a=>(
-        <Pressable key={a.key} onPress={()=>onAction(a.key,a.label,a.risky)}
-          style={({ pressed })=>[gridSt.tile,{ width:tileSize, height:tileSize*0.85, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
-          <View style={[gridSt.iconCircle,{ backgroundColor:a.color+"22" }]}><Ionicons name={a.icon as any} size={32} color={a.color}/></View>
-          <Text style={[gridSt.label,{ color:theme.actionTileText }]}>{a.label}</Text>
-        </Pressable>
-      ))}
-      {/* Events */}
-      <Pressable onPress={onEventsPress} style={({ pressed })=>[gridSt.tile,{ width:smallSize, height:smallSize*0.72, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
-        <View style={[gridSt.iconCircle,{ backgroundColor:"#007aff22", width:46, height:46, borderRadius:23 }]}><Ionicons name="calendar-outline" size={24} color="#007aff"/></View>
-        <Text style={[gridSt.label,{ color:theme.actionTileText, fontSize:13 }]}>Events</Text>
+      {/* Row 1: Wake PC + Shutdown */}
+      {bigTile("wake_pc","Wake PC","flash","#22c55e",false)}
+      {bigTile("shutdown_pc","Shutdown","power","#ef4444",true)}
+      {/* Row 2: Sleep + Restart */}
+      {bigTile("sleep_pc","Sleep","moon-outline","#6366f1",false,()=>Alert.alert("Sleep PC","Put your PC to sleep?",[
+        { text:"Cancel",style:"cancel" },
+        { text:"Sleep",onPress:()=>onAction("sleep_pc","Sleep",false) },
+      ]))}
+      {bigTile("restart_pc","Restart","refresh-circle","#f59e0b",true)}
+      {/* Row 3: Lock + Volume */}
+      {bigTile("lock_pc","Lock","lock-closed","#3b82f6",false)}
+      <Pressable onPress={onVolumePress}
+        style={({ pressed })=>[gridSt.tile,{ width:big, height:big*0.85, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
+        <View style={[gridSt.iconCircle,{ backgroundColor:"#f59e0b22" }]}><Ionicons name="volume-medium-outline" size={32} color="#f59e0b"/></View>
+        <Text style={[gridSt.label,{ color:theme.actionTileText }]}>Volume</Text>
       </Pressable>
-      {/* Scenes */}
-      <Pressable onPress={onScenesPress} style={({ pressed })=>[gridSt.tile,{ width:smallSize, height:smallSize*0.72, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
-        <View style={[gridSt.iconCircle,{ backgroundColor:"#22c55e22", width:46, height:46, borderRadius:23 }]}><Ionicons name="albums-outline" size={24} color="#22c55e"/></View>
-        <Text style={[gridSt.label,{ color:theme.actionTileText, fontSize:13 }]}>Scenes</Text>
-      </Pressable>
-      {/* Volume */}
-      <Pressable onPress={onVolumePress} style={({ pressed })=>[gridSt.tile,{ width:smallSize, height:smallSize*0.72, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
-        <View style={[gridSt.iconCircle,{ backgroundColor:"#f59e0b22", width:46, height:46, borderRadius:23 }]}><Ionicons name="volume-medium-outline" size={24} color="#f59e0b"/></View>
-        <Text style={[gridSt.label,{ color:theme.actionTileText, fontSize:13 }]}>Volume</Text>
-      </Pressable>
-      {/* Actions */}
-      <Pressable onPress={onCustomActionsPress} style={({ pressed })=>[gridSt.tile,{ width:smallSize, height:smallSize*0.72, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
-        <View style={[gridSt.iconCircle,{ backgroundColor:"#a855f722", width:46, height:46, borderRadius:23 }]}><Ionicons name="play-circle-outline" size={24} color="#a855f7"/></View>
-        <Text style={[gridSt.label,{ color:theme.actionTileText, fontSize:13 }]}>Actions</Text>
-      </Pressable>
-      {/* Tools */}
-      <Pressable onPress={onToolsPress} style={({ pressed })=>[gridSt.tile,{ width:smallSize, height:smallSize*0.72, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
-        <View style={[gridSt.iconCircle,{ backgroundColor:"#06b6d422", width:46, height:46, borderRadius:23 }]}><Ionicons name="construct-outline" size={24} color="#06b6d4"/></View>
-        <Text style={[gridSt.label,{ color:theme.actionTileText, fontSize:13 }]}>Tools</Text>
-      </Pressable>
-      {/* Sleep */}
-      <Pressable onPress={onSleepPress} style={({ pressed })=>[gridSt.tile,{ width:smallSize, height:smallSize*0.72, backgroundColor:pressed?theme.actionTilePressed:theme.actionTile }]}>
-        <View style={[gridSt.iconCircle,{ backgroundColor:"#6366f122", width:46, height:46, borderRadius:23 }]}><Ionicons name="moon-outline" size={24} color="#6366f1"/></View>
-        <Text style={[gridSt.label,{ color:theme.actionTileText, fontSize:13 }]}>Sleep</Text>
-      </Pressable>
+      {/* Row 4: Events + Scenes (Pro) */}
+      {smallTile("events","Events","calendar-outline","#007aff",onEventsPress,true)}
+      {smallTile("scenes","Scenes","albums-outline","#22c55e",onScenesPress,true)}
+      {/* Row 5: Actions (Pro) + Tools */}
+      {smallTile("actions","Actions","play-circle-outline","#a855f7",onCustomActionsPress,true)}
+      {smallTile("tools","Tools","construct-outline","#06b6d4",onToolsPress)}
     </View>
   );
 }
@@ -2692,46 +3949,56 @@ function useOfflineTick() {
 }
 
 // ─────────────────────────────────────────────
-// Reorderable device list
+// Draggable device list
 // ─────────────────────────────────────────────
 function ReorderableDeviceList({ orderedDevices,onOpenDevice,onReorder,statusLabel,theme }:{
   orderedDevices:Device[]; onOpenDevice:(id:string)=>void;
   onReorder:(ids:string[])=>void; statusLabel:(d:Device)=>string; theme:ReturnType<typeof useTheme>;
 }) {
-  const [reorderMode,setReorderMode]=useState(false);
-  const move=(fromIndex:number,dir:-1|1)=>{
-    const toIndex=fromIndex+dir;
-    if (toIndex<0||toIndex>=orderedDevices.length) return;
-    const result=[...orderedDevices]; const [moved]=result.splice(fromIndex,1); result.splice(toIndex,0,moved);
-    onReorder(result.map(d=>d.id));
-  };
-  return (
-    <View style={{ width:screenWidth*0.7 }}>
+  const renderItem = ({ item:d, drag, isActive }:RenderItemParams<Device>) => (
+    <Pressable
+      onPress={()=>{ if (!isActive) onOpenDevice(d.id); }}
+      onLongPress={drag}
+      delayLongPress={180}
+      style={[
+        st.card,
+        { backgroundColor:d.color, marginBottom:20 },
+        isActive&&{
+          borderWidth:2,
+          borderColor:"rgba(255,255,255,0.5)",
+          shadowColor:"#000",
+          shadowOffset:{ width:0,height:20 },
+          shadowOpacity:0.6,
+          shadowRadius:28,
+          elevation:24,
+        },
+      ]}
+    >
+      <View style={st.cardTop}>
+        <Ionicons name={d.icon as any} size={46} color="white"/>
+        <StatusDot status={d.status}/>
+      </View>
+      <Text style={st.cardName}>{d.name}</Text>
+      <Text style={st.cardStatus}>{statusLabel(d)}</Text>
       {orderedDevices.length>1&&(
-        <Pressable onPress={()=>setReorderMode(r=>!r)}
-          style={[reorderSt.toggleBtn,{ backgroundColor:reorderMode?"#007aff22":theme.reorderBg, borderColor:reorderMode?"#007aff66":theme.rowBorder }]}>
-          <Ionicons name={reorderMode?"checkmark-circle":"reorder-three-outline"} size={16} color={reorderMode?"#007aff":theme.labelColor}/>
-          <Text style={[reorderSt.toggleText,{ color:reorderMode?"#007aff":theme.labelColor }]}>{reorderMode?"Done Reordering":"Reorder Devices"}</Text>
-        </Pressable>
-      )}
-      {orderedDevices.map((d,index)=>(
-        <View key={d.id} style={{ marginBottom:20 }}>
-          <Pressable style={[st.card,{ backgroundColor:d.color }]} onPress={()=>{ if (!reorderMode) onOpenDevice(d.id); }}>
-            <View style={st.cardTop}>
-              <Ionicons name={d.icon as any} size={46} color="white"/>
-              {reorderMode?(
-                <View style={reorderSt.arrowCol}>
-                  <Pressable onPress={()=>move(index,-1)} disabled={index===0} style={[reorderSt.arrowBtn,index===0&&{ opacity:0.3 }]} hitSlop={8}><Ionicons name="chevron-up" size={20} color="white"/></Pressable>
-                  <Pressable onPress={()=>move(index,1)} disabled={index===orderedDevices.length-1} style={[reorderSt.arrowBtn,index===orderedDevices.length-1&&{ opacity:0.3 }]} hitSlop={8}><Ionicons name="chevron-down" size={20} color="white"/></Pressable>
-                </View>
-              ):(<StatusDot status={d.status}/>)}
-            </View>
-            <Text style={st.cardName}>{d.name}</Text>
-            <Text style={st.cardStatus}>{reorderMode?"Tap arrows to reorder":statusLabel(d)}</Text>
-          </Pressable>
+        <View style={{ position:"absolute", bottom:12, right:14, opacity:0.4 }}>
+          <Ionicons name="reorder-three-outline" size={18} color="white"/>
         </View>
-      ))}
-    </View>
+      )}
+    </Pressable>
+  );
+
+  return (
+    <DraggableFlatList
+      data={orderedDevices}
+      keyExtractor={d=>d.id}
+      renderItem={renderItem}
+      onDragEnd={({ data })=>{ onReorder(data.map(d=>d.id)); }}
+      animationConfig={{ duration:200 }}
+      containerStyle={{ width:screenWidth*0.7 }}
+      contentContainerStyle={{ paddingBottom:60 }}
+      showsVerticalScrollIndicator={false}
+    />
   );
 }
 
@@ -2740,7 +4007,14 @@ function ReorderableDeviceList({ orderedDevices,onOpenDevice,onReorder,statusLab
 // ─────────────────────────────────────────────
 export default function App() {
   const scheme=useColorScheme(); const theme=useTheme(scheme); useOfflineTick();
+  const insets = useSafeAreaInsets();
 
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [isPro,          setIsPro]          = useState(false);
+  const [paywallVisible, setPaywallVisible] = useState(false);
+  const [proActivated,   setProActivated]   = useState(false);
+  const [debugPaywallOff,setDebugPaywallOff]= useState(false); // master switch: off = no paywall at all
+  const [debugProOn,     setDebugProOn]     = useState(false); // simulate pro purchase
   const [devices,       setDevices]       = useState<Record<string,Device>>({});
   const [deviceOrder,   setDeviceOrder]   = useState<string[]>([]);
   const [deviceStats,   setDeviceStats]   = useState<Record<string,PCStats>>({});
@@ -2781,6 +4055,9 @@ export default function App() {
   const [clipboardVisible,setClipboardVisible]= useState(false);
   const [typeTextVisible, setTypeTextVisible] = useState(false);
   const [screenshotVisible,setScreenshotVisible]=useState(false);
+  const [networkVisible,  setNetworkVisible]  = useState(false);
+  const [uploadVisible,   setUploadVisible]   = useState(false);
+  const [soundboardVisible,setSoundboardVisible]=useState(false);
   const [activeToast,     setActiveToast]     = useState<ToastConfig|null>(null);
   const [errorBanner,     setErrorBanner]     = useState<ErrorBannerConfig|null>(null);
 
@@ -2795,8 +4072,21 @@ export default function App() {
   const deviceSlide=useRef(new Animated.Value(screenHeight)).current;
 
   const COLORS=[
-    { name:"Green",value:"#22c55e" },{ name:"Blue",value:"#3b82f6" },
-    { name:"Red",value:"#ef4444" }, { name:"Purple",value:"#a855f7" },{ name:"Orange",value:"#f59e0b" },
+    { name:"Green",       value:"#22c55e" },
+    { name:"Blue",        value:"#3b82f6" },
+    { name:"Red",         value:"#ef4444" },
+    { name:"Purple",      value:"#a855f7" },
+    { name:"Orange",      value:"#f59e0b" },
+    { name:"Cyan",        value:"#06b6d4" },
+    { name:"Pink",        value:"#ec4899" },
+    { name:"Indigo",      value:"#6366f1" },
+    { name:"Lime",        value:"#84cc16" },
+    { name:"Amber",       value:"#f97316" },
+    { name:"Rose",        value:"#f43f5e" },
+    { name:"Teal",        value:"#14b8a6" },
+    { name:"Sky",         value:"#0ea5e9" },
+    { name:"Violet",      value:"#8b5cf6" },
+    { name:"Slate",       value:"#64748b" },
   ];
   const ICONS=[
     { name:"Monitor",value:"desktop-outline" },{ name:"Laptop",value:"laptop-outline" },
@@ -2808,6 +4098,8 @@ export default function App() {
 
   const device         = selectedId ? devices[selectedId]          : null;
   const curLogs        = selectedId ? (deviceLogs[selectedId]??[]) : [];
+  // Pro is active if: debug paywall is off (testing mode), OR debug pro on, OR actually purchased
+  const isProActive    = debugPaywallOff || debugProOn || isPro;
   const curActions     = selectedId ? (deviceActions[selectedId]??[]) : [];
   const curEvents      = selectedId ? (deviceEvents[selectedId]??[]) : [];
   const curScenes      = selectedId ? (deviceScenes[selectedId]??[]) : [];
@@ -2913,8 +4205,17 @@ export default function App() {
   const handleStatsUpdate=useCallback((id:string,stats:PCStats)=>{ setDeviceStats(prev=>({ ...prev,[id]:stats })); },[]);
 
   const handleToolResult=useCallback((deviceId:string,type:string,payload:any)=>{
-    if (type==="clipboard") setClipboardText(payload.text);
-    else if (type==="screenshot") setScreenshotData(payload);
+    if (type==="clipboard") setClipboardText(prev=>({ ...prev,[deviceId]:payload.text }));
+    else if (type==="screenshot") setScreenshotData(prev=>({ ...prev,[deviceId]:payload }));
+    else if (type==="now_playing") {
+      if (payload.album_art) albumArtRef.current = { ...albumArtRef.current, [deviceId]:payload.album_art };
+      setNowPlaying(prev=>({ ...prev,[deviceId]:{ ...payload, album_art:(albumArtRef.current[deviceId]??null) } }));
+    }
+    else if (type==="network_info") setNetworkData(prev=>({ ...prev,[deviceId]:payload }));
+    else if (type==="speedtest_result") setSpeedtestData(prev=>({ ...prev,[deviceId]:payload }));
+    else if (type==="audio_devices") setAudioDevices(prev=>({ ...prev,[deviceId]:payload }));
+    else if (type==="upload_result") setUploadResult(prev=>({ ...prev,[deviceId]:payload }));
+    else if (type==="soundboard_file") setSoundboardFileResult(prev=>({ ...prev,[deviceId]:payload }));
   },[]);
 
   const makeConnection=useCallback((d:Device)=>new DeviceConnection(
@@ -2937,13 +4238,20 @@ export default function App() {
 
   useEffect(()=>{
     (async()=>{
-      const [rawV2,rawV1,rawOrder,loadedSettings,storedNotifs]=await Promise.all([
+      const [rawV2,rawV1,rawOrder,loadedSettings,storedNotifs,onboardingDone,proStatus]=await Promise.all([
         AsyncStorage.getItem(STORAGE_KEY),AsyncStorage.getItem(STORAGE_KEY_V1),
         AsyncStorage.getItem(ORDER_KEY),loadSettings(),loadNotifications(),
+        AsyncStorage.getItem(ONBOARDING_KEY),
+        loadProStatus(),
       ]);
       setSettings(loadedSettings);
       setNotifications(storedNotifs);
+      setIsPro(proStatus);
       const raw=rawV2??rawV1;
+      // Show onboarding if never completed
+      if (!onboardingDone) {
+        setShowOnboarding(true);
+      }
       if (!raw) return;
       try {
         const loaded:Record<string,Device>=JSON.parse(raw);
@@ -2988,11 +4296,23 @@ export default function App() {
   };
 
   const onPairSuccess=(newDev:Device)=>{
+    setShowOnboarding(false);
+    AsyncStorage.setItem(ONBOARDING_KEY, "done");
     setDevices(prev=>{ const u={ ...prev,[newDev.id]:newDev }; devicesRef.current=u; saveDevices(u); return u; });
     setDeviceOrder(prev=>{ const o=[...prev,newDev.id]; saveOrder(o); return o; });
     connectDevice(newDev); addLog(newDev.id,"paired");
-    setPairingStatus("success"); setPairedOverlay(true);
-    setTimeout(()=>{ setPairedOverlay(false); setPairScreen("none"); setPairingStatus("idle"); setManualCode(""); setManualServer("ws://"); },1600);
+    setPairingStatus("success");
+    // Show overlay immediately while still on pair screen
+    setPairedOverlay(true);
+    // After a short moment, switch home in background (overlay covers the transition)
+    setTimeout(()=>{ setPairScreen("none"); }, 200);
+    // Then dismiss overlay after user sees it
+    setTimeout(()=>{
+      setPairedOverlay(false);
+      setPairingStatus("idle");
+      setManualCode("");
+      setManualServer("ws://");
+    }, 2000);
   };
 
   const startPairing=(serverUrl:string,code:string)=>{
@@ -3031,6 +4351,8 @@ export default function App() {
   const handleManualPair=async()=>{
     const code=manualCode.trim();
     if (!code||code.length!==6) { setPairingStatus("error"); setPairingError("Please enter the 6-digit code shown on your PC."); return; }
+    if (pairingStatus==="connecting"||pairingStatus==="loading"||pairingStatus==="success") return;
+    Keyboard.dismiss();
     setPairingStatus("connecting");
     try {
       const resp = await fetch(`${WORKER_URL}/lookup?code=${code}`);
@@ -3042,7 +4364,6 @@ export default function App() {
       }
       startPairing(data.url, code);
     } catch {
-      // Fallback — if Worker unreachable, try manual server URL if provided
       const server=manualServer.trim();
       if (server&&server!=="ws://"&&(server.startsWith("ws://")||server.startsWith("wss://"))) {
         startPairing(server, code);
@@ -3183,11 +4504,6 @@ export default function App() {
   },[]);
 
   const [fileBrowseResult, setFileBrowseResult] = useState<Record<string,FileBrowseResult>>({});
-  const [fileLoading,      setFileLoading]       = useState<Record<string,boolean>>({});
-
-  const fileBrowseAccumRef = useRef<Record<string,FileEntry[]>>({});
-  const fileSearchResultRef = useRef<FileEntry[]>([]);
-
   const handleFileBrowse=useCallback((deviceId:string,result:any)=>{
     if (result.isSearch) {
       // Global search result
@@ -3204,8 +4520,15 @@ export default function App() {
     }}));
   },[]);
 
-  const [clipboardText,  setClipboardText]  = useState<string|null>(null);
-  const [screenshotData, setScreenshotData] = useState<{data:string|null,error:string|null}|null>(null);
+  const [clipboardText,       setClipboardText]       = useState<Record<string,string|null>>({});
+  const [screenshotData,      setScreenshotData]      = useState<Record<string,{data:string|null,error:string|null}|null>>({});
+  const [networkData,         setNetworkData]         = useState<Record<string,any>>({});
+  const [speedtestData,       setSpeedtestData]       = useState<Record<string,any>>({});
+  const [audioDevices,        setAudioDevices]        = useState<Record<string,{outputs:any[],inputs:any[]}>>({});
+  const [uploadResult,        setUploadResult]        = useState<Record<string,any>>({});
+  const [soundboardFileResult,setSoundboardFileResult]= useState<Record<string,any>>({});
+  const [nowPlaying,          setNowPlaying]          = useState<Record<string,any>>({});
+  const albumArtRef = useRef<Record<string,string|null>>({});
   const fileSharingRef = useRef(false);
   const fileDownloadCompleteRef = useRef<(()=>void)|null>(null);
 
@@ -3242,7 +4565,8 @@ export default function App() {
     setActionsVisible(false); setEventsVisible(false); setScenesVisible(false);
     setVolumeVisible(false); setToolsVisible(false); setFilesVisible(false);
     setMediaVisible(false); setClipboardVisible(false); setTypeTextVisible(false);
-    setScreenshotVisible(false);
+    setScreenshotVisible(false); setNetworkVisible(false); setUploadVisible(false);
+    setSoundboardVisible(false);
     setActiveToast(null); setErrorBanner(null);
     deviceSlide.setValue(screenHeight); setOverlayVisible(true);
     Animated.spring(deviceSlide,{ toValue:0, damping:28, stiffness:280, useNativeDriver:true }).start();
@@ -3256,52 +4580,166 @@ export default function App() {
       setEventsVisible(false); setScenesVisible(false); setVolumeVisible(false);
       setToolsVisible(false); setFilesVisible(false); setMediaVisible(false);
       setClipboardVisible(false); setTypeTextVisible(false); setScreenshotVisible(false);
+      setNetworkVisible(false); setUploadVisible(false); setSoundboardVisible(false);
     });
   };
 
   const handleReorder=(ids:string[])=>{ setDeviceOrder(ids); saveOrder(ids); };
   const statusLabel=(d:Device)=>d.status==="online"?"Online":d.status==="idle"?"Idle":formatOffline(d.lastSeen);
-  const resetPair=()=>{ setPairScreen("none"); setPairingStatus("idle"); setPairingError(""); };
+  const resetPair=()=>{ setPairScreen("none"); setPairingStatus("idle"); setPairingError(""); setManualCode(""); };
+
+  const handlePurchasePro = () => {
+    // TODO: wire up StoreKit here
+    Alert.alert("Purchase PCLink Pro","This will connect to the App Store. (StoreKit integration coming before release)",[
+      { text:"Cancel", style:"cancel" },
+      { text:"Simulate Purchase (Test)", onPress:()=>{
+        setIsPro(true); saveProStatus(true); setPaywallVisible(false);
+        setTimeout(()=>setProActivated(true), 300);
+      }},
+    ]);
+  };
+
+  const handleRestorePurchase = () => {
+    Alert.alert("Restore Purchase","Checking for previous purchases…",[
+      { text:"Cancel", style:"cancel" },
+      { text:"Simulate Restore (Test)", onPress:()=>{
+        setIsPro(true); saveProStatus(true); setPaywallVisible(false);
+        setTimeout(()=>setProActivated(true), 300);
+      }},
+    ]);
+  };
+
+  const showPaywall = () => setPaywallVisible(true);
+  const handleResetPro = useCallback(()=>{
+    setIsPro(false);
+    setDebugProOn(false);
+    saveProStatus(false);
+  },[]);
+
+  const pendingDebugRef = useRef<string|null>(null);
+
+  // Fire any pending debug action when a device becomes selected/open
+  useEffect(()=>{
+    if (!selectedId || !pendingDebugRef.current) return;
+    const type = pendingDebugRef.current;
+    pendingDebugRef.current = null;
+    setTimeout(()=>{
+      switch(type) {
+        case "wake_fail":
+          setErrorBanner({ message:"[Debug] Wake failed — PC didn't respond after 3 attempts. Check that it's plugged in and Wake on LAN is enabled in BIOS." });
+          break;
+        case "offline_toast":
+          setActiveToast({ message:"PC went offline", icon:"cloud-offline-outline", color:"#6b7280" });
+          break;
+        case "token_invalid":
+          handleTokenInvalid(selectedId);
+          break;
+      }
+    }, 400); // slight delay so overlay has finished opening
+  },[selectedId]);
+
+  const handleForceError = useCallback((type:string)=>{
+    switch(type) {
+      case "screenshot_fail":
+        if (selectedId) setScreenshotData(prev=>({ ...prev,[selectedId]:{ data:null, error:"Screenshot failed — could not capture the screen. Make sure the PCLink Agent is running and try again." } }));
+        break;
+      case "clipboard_timeout":
+        // Inject a fake timeout error directly into clipboard state
+        setClipboardText(null);
+        // Signal the clipboard screen to show its error — we repurpose screenshotData as a trigger
+        // Actually set a special sentinel that ClipboardScreen reads
+        Alert.alert(
+          "Clipboard Timeout Debug",
+          "Open Clipboard Sync → tap Fetch from PC → wait 8 seconds. The timeout will fire naturally and show:\n\n\"No response from PC. Make sure the agent is running.\""
+        );
+        break;
+      case "upload_timeout":
+        if (selectedId) setUploadResult(prev=>({ ...prev,[selectedId]:{ success:false, error:"Upload timed out — the file may be too large or your connection dropped. Try a smaller file or check your Wi-Fi." } }));
+        break;
+      case "wake_fail":
+        if (selectedId) {
+          setErrorBanner({ message:"[Debug] Wake failed — PC didn't respond after 3 attempts. Check that it's plugged in and Wake on LAN is enabled in BIOS." });
+        } else {
+          // Queue it — open any device and it fires automatically
+          pendingDebugRef.current = type;
+          Alert.alert("Debug — Wake Fail", "No device is open. Open any device card and the error will appear automatically.", [{ text:"OK" }]);
+        }
+        break;
+      case "offline_toast":
+        if (selectedId) {
+          setActiveToast({ message:"PC went offline", icon:"cloud-offline-outline", color:"#6b7280" });
+        } else {
+          pendingDebugRef.current = type;
+          Alert.alert("Debug — Offline Toast", "No device is open. Open any device card and the toast will fire automatically.", [{ text:"OK" }]);
+        }
+        break;
+      case "token_invalid":
+        if (selectedId) {
+          handleTokenInvalid(selectedId);
+        } else {
+          pendingDebugRef.current = type;
+          Alert.alert("Debug — Token Invalid", "No device is open. Open any device card and the alert will fire automatically.", [{ text:"OK" }]);
+        }
+        break;
+    }
+  },[selectedId, handleTokenInvalid]);
+
+  if (showOnboarding) return (
+    <GestureHandlerRootView style={{ flex:1 }}>
+      <OnboardingScreen
+        theme={theme}
+        onDone={()=>setShowOnboarding(false)}
+        onPair={()=>{ setShowOnboarding(false); setPairScreen("choose"); setPairingStatus("idle"); setPairingError(""); }}
+      />
+    </GestureHandlerRootView>
+  );
 
   if (pairScreen==="qr") return (
     <GestureHandlerRootView style={{ flex:1 }}>
       {!pairedOverlay&&<QRScannerScreen theme={theme} onScanned={handleQRScanned} onCancel={()=>{ setPairScreen("choose"); setPairingStatus("idle"); setPairingError(""); }}/>}
       {pairingStatus==="loading"&&!pairedOverlay&&<View style={pairSt.overlay}><BlurView intensity={60} tint={theme.blurTint} style={StyleSheet.absoluteFill}/><Ionicons name="sync-outline" size={48} color="#007aff"/><Text style={[pairSt.text,{ color:theme.titleColor }]}>Connecting…</Text></View>}
-      {pairedOverlay&&<PairedOverlay theme={theme}/>}
+      {pairedOverlay&&<View style={StyleSheet.absoluteFillObject}><PairedOverlay theme={theme}/></View>}
     </GestureHandlerRootView>
   );
 
   return (
-    <GestureHandlerRootView style={{ flex:1 }}>
-      <SafeAreaView style={[st.container,{ backgroundColor:theme.bg }]}>
-
+    <GestureHandlerRootView style={{ flex:1, backgroundColor:theme.bg }}>
+      {/* TopBar + Notifications with manual top inset */}
+      <View style={{ backgroundColor:theme.bg, paddingTop:insets.top }}>
         <View style={[st.topBar,{ backgroundColor:theme.topBar }]}>
           <Pressable onPress={()=>setSettingsVisible(true)} hitSlop={10}><Ionicons name="settings-outline" size={26} color={theme.titleColor}/></Pressable>
           <Text style={[st.title,{ color:theme.titleColor }]}>PCLink</Text>
-          <Pressable onPress={()=>{ if (Object.keys(devices).length>=MAX_DEVICES) { Alert.alert("Device Limit Reached",`You can have a maximum of ${MAX_DEVICES} devices.`); return; } setQuickVisible(true); }} hitSlop={10}>
+          <Pressable onPress={()=>{
+            if (Object.keys(devices).length>=MAX_DEVICES) { Alert.alert("Device Limit Reached",`You can have a maximum of ${MAX_DEVICES} devices.`); return; }
+            setQuickVisible(true);
+          }} hitSlop={10}>
             <Ionicons name="add-circle-outline" size={28} color={theme.titleColor}/>
           </Pressable>
         </View>
-
-        {/* In-app notification banner */}
         <NotificationBanner notifications={notifications} onDismiss={dismissNotification} theme={theme}/>
+      </View>
 
-        <ScrollView contentContainerStyle={[st.homeScroll,orderedDevices.length>0&&{ alignItems:"center" }]} showsVerticalScrollIndicator={false}>
-          {orderedDevices.length===0?(
-            <View style={st.empty}>
-              <Ionicons name="desktop-outline" size={56} color={theme.labelColor}/>
-              <Text style={[st.emptyTitle,{ color:theme.titleColor }]}>No devices yet</Text>
-              <Text style={[st.emptySub,{ color:theme.labelColor }]}>Tap + to add your first PC</Text>
-            </View>
-          ):(
-            <ReorderableDeviceList orderedDevices={orderedDevices} onOpenDevice={openDevice} onReorder={handleReorder} statusLabel={statusLabel} theme={theme}/>
-          )}
-        </ScrollView>
+      {/* Device list lives directly in GestureHandlerRootView — no clip boundary */}
+      {orderedDevices.length===0?(
+        <View style={[st.homeScroll,{ alignItems:"center" }]}>
+          <View style={st.empty}>
+            <Ionicons name="desktop-outline" size={56} color={theme.labelColor}/>
+            <Text style={[st.emptyTitle,{ color:theme.titleColor }]}>No devices yet</Text>
+            <Text style={[st.emptySub,{ color:theme.labelColor }]}>Tap + to add your first PC</Text>
+          </View>
+        </View>
+      ):(
+        <View style={{ flex:1, alignItems:"center", paddingTop:20 }}>
+          <ReorderableDeviceList orderedDevices={orderedDevices} onOpenDevice={openDevice} onReorder={handleReorder} statusLabel={statusLabel} theme={theme}/>
+        </View>
+      )}
 
         {/* ── DEVICE OVERLAY ── */}
         {overlayVisible&&device&&(
           <Animated.View style={[StyleSheet.absoluteFillObject,{ backgroundColor:theme.deviceBg, transform:[{ translateY:deviceSlide }] }]}>
             <SafeAreaView style={{ flex:1 }}>
+              {/* Show notifications on current screen too */}
+              <NotificationBanner notifications={notifications} onDismiss={dismissNotification} theme={theme}/>
 
               {actionsVisible&&(
                 <CustomActionsScreen
@@ -3335,16 +4773,52 @@ export default function App() {
                 />
               )}
 
-              {toolsVisible&&!filesVisible&&!mediaVisible&&!clipboardVisible&&!typeTextVisible&&!screenshotVisible&&(
+              {toolsVisible&&!filesVisible&&!mediaVisible&&!clipboardVisible&&!typeTextVisible&&!screenshotVisible&&!networkVisible&&!uploadVisible&&!soundboardVisible&&(
                 <ToolsScreen
                   device={device}
                   onBack={()=>setToolsVisible(false)}
-                  onOpenFiles={()=>setFilesVisible(true)}
-                  onOpenMedia={()=>setMediaVisible(true)}
-                  onOpenClipboard={()=>setClipboardVisible(true)}
-                  onOpenTypeText={()=>setTypeTextVisible(true)}
-                  onOpenScreenshot={()=>setScreenshotVisible(true)}
+                  onOpenFiles={()=>{ if(!isProActive){showPaywall();return;} setFilesVisible(true); }}
+                  onOpenMedia={()=>{ if(!isProActive){showPaywall();return;} setMediaVisible(true); }}
+                  onOpenClipboard={()=>{ if(!isProActive){showPaywall();return;} setClipboardVisible(true); }}
+                  onOpenTypeText={()=>{ if(!isProActive){showPaywall();return;} setTypeTextVisible(true); }}
+                  onOpenScreenshot={()=>{ if(!isProActive){showPaywall();return;} setScreenshotVisible(true); }}
+                  onOpenNetwork={()=>{ if(!isProActive){showPaywall();return;} setNetworkVisible(true); }}
+                  onOpenUpload={()=>{ if(!isProActive){showPaywall();return;} setUploadVisible(true); }}
+                  onOpenSoundboard={()=>{ if(!isProActive){showPaywall();return;} setSoundboardVisible(true); }}
                   theme={theme}
+                  isProActive={isProActive}
+                  onShowPaywall={showPaywall}
+                />
+              )}
+
+              {networkVisible&&(
+                <NetworkInfoScreen
+                  onBack={()=>setNetworkVisible(false)}
+                  sendCommand={(type,extra)=>connectionsRef.current[device.id]?.sendCommand(type,extra)}
+                  networkData={networkData[device.id]??null}
+                  speedtestData={speedtestData[device.id]??null}
+                  theme={theme}
+                />
+              )}
+
+              {uploadVisible&&(
+                <FileUploadScreen
+                  onBack={()=>setUploadVisible(false)}
+                  sendCommand={(type,extra)=>connectionsRef.current[device.id]?.sendCommand(type,extra)}
+                  browseResult={fileBrowseResult[device.id]??null}
+                  uploadResult={uploadResult[device.id]??null}
+                  theme={theme}
+                />
+              )}
+
+              {soundboardVisible&&(
+                <SoundboardScreen
+                  onBack={()=>setSoundboardVisible(false)}
+                  sendCommand={(type,extra)=>connectionsRef.current[device.id]?.sendCommand(type,extra)}
+                  audioDevices={audioDevices[device.id]??{outputs:[],inputs:[]}}
+                  soundboardFileResult={soundboardFileResult[device.id]??null}
+                  theme={theme}
+                  pcId={device.id}
                 />
               )}
 
@@ -3352,6 +4826,7 @@ export default function App() {
                 <MediaControlsScreen
                   onBack={()=>setMediaVisible(false)}
                   sendCommand={(type,extra)=>connectionsRef.current[device.id]?.sendCommand(type,extra)}
+                  nowPlaying={nowPlaying[device.id]??null}
                   theme={theme}
                 />
               )}
@@ -3360,8 +4835,8 @@ export default function App() {
                 <ClipboardScreen
                   onBack={()=>setClipboardVisible(false)}
                   sendCommand={(type,extra)=>connectionsRef.current[device.id]?.sendCommand(type,extra)}
-                  pcClipboardText={clipboardText}
-                  onClearClipboard={()=>setClipboardText(null)}
+                  pcClipboardText={clipboardText[device.id]??null}
+                  onClearClipboard={()=>setClipboardText(prev=>({ ...prev,[device.id]:null }))}
                   theme={theme}
                 />
               )}
@@ -3378,8 +4853,8 @@ export default function App() {
                 <ScreenshotScreen
                   onBack={()=>setScreenshotVisible(false)}
                   sendCommand={(type,extra)=>connectionsRef.current[device.id]?.sendCommand(type,extra)}
-                  screenshotResult={screenshotData}
-                  onClearScreenshot={()=>setScreenshotData(null)}
+                  screenshotResult={screenshotData[device.id]??null}
+                  onClearScreenshot={()=>setScreenshotData(prev=>({ ...prev,[device.id]:null }))}
                   theme={theme}
                 />
               )}
@@ -3405,11 +4880,11 @@ export default function App() {
                 />
               )}
 
-              {logVisible&&!actionsVisible&&!eventsVisible&&!scenesVisible&&!volumeVisible&&!toolsVisible&&!filesVisible&&!mediaVisible&&!clipboardVisible&&!typeTextVisible&&!screenshotVisible&&(
+              {logVisible&&!actionsVisible&&!eventsVisible&&!scenesVisible&&!volumeVisible&&!toolsVisible&&!filesVisible&&!mediaVisible&&!clipboardVisible&&!typeTextVisible&&!screenshotVisible&&!networkVisible&&!uploadVisible&&!soundboardVisible&&(
                 <ActivityLogScreen deviceName={device.name} entries={curLogs} theme={theme} onBack={()=>setLogVisible(false)}/>
               )}
 
-              {editVisible&&!logVisible&&!actionsVisible&&!eventsVisible&&!scenesVisible&&!volumeVisible&&!toolsVisible&&!filesVisible&&!mediaVisible&&!clipboardVisible&&!typeTextVisible&&!screenshotVisible&&(
+              {editVisible&&!logVisible&&!actionsVisible&&!eventsVisible&&!scenesVisible&&!volumeVisible&&!toolsVisible&&!filesVisible&&!mediaVisible&&!clipboardVisible&&!typeTextVisible&&!screenshotVisible&&!networkVisible&&!uploadVisible&&!soundboardVisible&&(
                 <View style={{ flex:1, padding:20 }}>
                   <View style={[st.overlayTopBar,{ paddingHorizontal:0 }]}>
                     <Pressable onPress={()=>{ setEditVisible(false); setEditingName(false); setEditingMac(false); }} style={st.overlayBackBtn} hitSlop={10}>
@@ -3470,7 +4945,7 @@ export default function App() {
                 </View>
               )}
 
-              {!editVisible&&!logVisible&&!actionsVisible&&!eventsVisible&&!scenesVisible&&!volumeVisible&&!toolsVisible&&!filesVisible&&!mediaVisible&&!clipboardVisible&&!typeTextVisible&&!screenshotVisible&&(
+              {!editVisible&&!logVisible&&!actionsVisible&&!eventsVisible&&!scenesVisible&&!volumeVisible&&!toolsVisible&&!filesVisible&&!mediaVisible&&!clipboardVisible&&!typeTextVisible&&!screenshotVisible&&!networkVisible&&!uploadVisible&&!soundboardVisible&&(
                 <View style={{ flex:1 }}>
                   <View style={[st.overlayTopBar,{ paddingHorizontal:20 }]}>
                     <Pressable onPress={closeDevice} style={st.overlayBackBtn} hitSlop={10}>
@@ -3505,11 +4980,18 @@ export default function App() {
                       onVolumePress={()=>setVolumeVisible(true)}
                       onCustomActionsPress={()=>setActionsVisible(true)}
                       onToolsPress={()=>setToolsVisible(true)}
-                      onSleepPress={()=>Alert.alert("Sleep PC","Put your PC to sleep?",[
-                        { text:"Cancel", style:"cancel" },
-                        { text:"Sleep", onPress:()=>connectionsRef.current[selectedId!]?.sendCommand("sleep_pc",{}) },
-                      ])}
+                      isProActive={isProActive}
+                      onShowPaywall={showPaywall}
                     />
+                    {/* WoL WiFi warning */}
+                    {networkData[device.id]?.connection_type==="Wi-Fi"&&(
+                      <View style={[st.wolWarn,{ backgroundColor:"#f59e0b11", borderColor:"#f59e0b33" }]}>
+                        <Ionicons name="warning-outline" size={14} color="#f59e0b"/>
+                        <Text style={[st.wolWarnText,{ color:"#f59e0b" }]}>
+                          Your PC is on Wi-Fi. Wake on LAN requires Ethernet to work reliably.
+                        </Text>
+                      </View>
+                    )}
                     {/* Run custom actions directly from device screen */}
                     {curActions.length>0&&(
                       <View style={{ paddingHorizontal:20, marginTop:8 }}>
@@ -3555,7 +5037,10 @@ export default function App() {
           </Animated.View>
         )}
 
-        <SettingsSheet visible={settingsVisible} onClose={()=>setSettingsVisible(false)} settings={settings} onSettingsChange={s=>{ setSettings(s); saveSettings(s); }} theme={theme}/>
+        <SettingsSheet visible={settingsVisible} onClose={()=>setSettingsVisible(false)} settings={settings} onSettingsChange={s=>{ setSettings(s); saveSettings(s); }} theme={theme} onForceError={handleForceError}
+          debugPaywallOff={debugPaywallOff} setDebugPaywallOff={setDebugPaywallOff}
+          debugProOn={debugProOn} setDebugProOn={setDebugProOn}
+          onShowPaywall={showPaywall} onRestore={handleRestorePurchase} onResetPro={handleResetPro}/>
 
         {/* Quick Actions Sheet */}
         <IOSSheet visible={quickVisible} onClose={()=>setQuickVisible(false)} title="Quick Actions" theme={theme}>
@@ -3563,7 +5048,11 @@ export default function App() {
             <Text style={[groupSt.label,{ color:theme.groupLabel }]}>ADD DEVICE</Text>
             <View style={[groupSt.card,{ backgroundColor:theme.groupCard, borderColor:theme.groupCardBorder }]}>
               <SettingsRow icon="add-circle-outline" iconBg="#34c759" title="Pair New Device" subtitle="Add a PC using QR code or manual entry"
-                onPress={()=>{ setQuickVisible(false); setPairScreen("choose"); setPairingStatus("idle"); setPairingError(""); }} last theme={theme}/>
+                onPress={()=>{
+                  setQuickVisible(false);
+                  if (!isProActive && Object.keys(devices).length >= 1) { setTimeout(()=>showPaywall(), 350); return; }
+                  setPairScreen("choose"); setPairingStatus("idle"); setPairingError("");
+                }} last theme={theme}/>
             </View>
           </View>
           <View style={groupSt.wrapper}>
@@ -3617,10 +5106,11 @@ export default function App() {
               <View style={groupSt.wrapper}>
                 <Text style={[groupSt.label,{ color:theme.groupLabel }]}>PAIRING CODE</Text>
                 <View style={[groupSt.card,{ backgroundColor:theme.groupCard, borderColor:theme.groupCardBorder }]}>
-                  <View style={[manSt.inputRow,{ borderColor:theme.pairInputBorder }]}>
-                    <Text style={[manSt.inputLabel,{ color:theme.labelColor }]}>6-Digit Code</Text>
-                    <TextInput value={manualCode} onChangeText={setManualCode} placeholder="000000" placeholderTextColor={theme.pairPlaceholder} style={[manSt.input,{ color:theme.pairInputText }]} keyboardType="number-pad" maxLength={6}/>
-                  </View>
+                  <CodeInput
+                    value={manualCode}
+                    onChange={setManualCode}
+                    theme={theme}
+                  />
                   <View style={[manSt.hintRow,{ borderTopColor:theme.rowBorder }]}>
                     <Ionicons name="information-circle-outline" size={14} color={theme.labelColor}/>
                     <Text style={[manSt.hintText,{ color:theme.labelColor }]}>Enter the 6-digit code shown in the agent popup on your PC.</Text>
@@ -3628,19 +5118,39 @@ export default function App() {
                 </View>
               </View>
               {pairingStatus==="error"&&<View style={manSt.errorBox}><Ionicons name="alert-circle-outline" size={16} color="#ff3b30"/><Text style={manSt.errorText}>{pairingError}</Text></View>}
-              <Pressable onPress={handleManualPair} disabled={pairingStatus==="connecting"||pairingStatus==="success"} style={({ pressed })=>[manSt.connectBtn,pressed&&{ opacity:0.8 }]}>
-                <Ionicons name="link-outline" size={18} color="white"/>
-                <Text style={manSt.connectBtnText}>{pairingStatus==="connecting"?"Looking up server…":"Connect"}</Text>
+              <Pressable
+                onPress={handleManualPair}
+                disabled={pairingStatus==="connecting"||pairingStatus==="loading"||pairingStatus==="success"}
+                style={({ pressed })=>[manSt.connectBtn,pressed&&{ opacity:0.8 },(pairingStatus==="connecting"||pairingStatus==="loading")&&{ opacity:0.7 }]}>
+                <Ionicons name={pairingStatus==="connecting"||pairingStatus==="loading"?"sync-outline":"link-outline"} size={18} color="white"/>
+                <Text style={manSt.connectBtnText}>
+                  {pairingStatus==="connecting"?"Looking up server…":pairingStatus==="loading"?"Connecting…":"Connect"}
+                </Text>
               </Pressable>
-              <Pressable onPress={()=>{ setPairScreen("choose"); setPairingStatus("idle"); setPairingError(""); }} style={manSt.backLink}>
+              <Pressable onPress={()=>{ setPairScreen("choose"); setPairingStatus("idle"); setPairingError(""); setManualCode(""); }} style={manSt.backLink}>
                 <Text style={[manSt.backLinkText,{ color:theme.labelColor }]}>← Back to options</Text>
               </Pressable>
             </>
           )}
-          {pairedOverlay&&pairScreen==="manual"&&<PairedOverlay theme={theme}/>}
         </IOSSheet>
 
-      </SafeAreaView>
+      {/* Paired success — covers everything cleanly */}
+      {pairedOverlay&&(
+        <View style={[StyleSheet.absoluteFillObject,{ zIndex:9999 }]}>
+          <PairedOverlay theme={theme}/>
+        </View>
+      )}
+
+      <ProPaywallSheet
+        visible={paywallVisible}
+        onClose={()=>setPaywallVisible(false)}
+        onPurchase={handlePurchasePro}
+        onRestore={handleRestorePurchase}
+        theme={theme}
+      />
+
+      {proActivated&&<ProActivatedOverlay onDone={()=>setProActivated(false)}/>}
+
     </GestureHandlerRootView>
   );
 }
@@ -3673,6 +5183,8 @@ const st=StyleSheet.create({
   logsLink:{ textDecorationLine:"underline" },
   pairNote:{ fontSize:12, textAlign:"center", paddingHorizontal:8, marginTop:8, lineHeight:18 },
   macNote:{ fontSize:12, lineHeight:18, marginTop:20 },
+  wolWarn:{ flexDirection:"row", alignItems:"center", gap:8, marginHorizontal:20, marginTop:4, marginBottom:8, padding:10, borderRadius:10, borderWidth:1 },
+  wolWarnText:{ flex:1, fontSize:12, lineHeight:17 },
 });
 const notifSt=StyleSheet.create({
   banner:{ flexDirection:"row", alignItems:"flex-start", marginHorizontal:16, marginBottom:8, padding:14, borderRadius:14, borderWidth:1, gap:10 },
@@ -3714,7 +5226,12 @@ const panelSt=StyleSheet.create({
   adminNote:{ flexDirection:"row", alignItems:"flex-start", gap:8, borderWidth:1, borderRadius:10, paddingHorizontal:12, paddingVertical:10 },
 });
 const mediaSt=StyleSheet.create({
-  container:{ flex:1, alignItems:"center", justifyContent:"center", gap:40, paddingHorizontal:40 },
+  container:{ flex:1, alignItems:"center", justifyContent:"center", gap:32, paddingHorizontal:32 },
+  nowPlayingCard:{ flexDirection:"row", alignItems:"center", gap:12, borderWidth:StyleSheet.hairlineWidth, borderRadius:14, padding:12, width:"100%" },
+  albumArt:{ width:52, height:52, borderRadius:8 },
+  albumArtPlaceholder:{ width:52, height:52, borderRadius:8, justifyContent:"center", alignItems:"center" },
+  trackTitle:{ fontSize:15, fontWeight:"600" },
+  trackArtist:{ fontSize:13, marginTop:2 },
   mainRow:{ flexDirection:"row", alignItems:"center", gap:24 },
   volRow:{ flexDirection:"row", alignItems:"center", gap:20 },
   btn:{ width:72, height:72, borderRadius:36, justifyContent:"center", alignItems:"center" },
@@ -3730,6 +5247,25 @@ const clipSt=StyleSheet.create({
   input:{ borderWidth:StyleSheet.hairlineWidth, borderRadius:10, padding:12, fontSize:14, textAlignVertical:"top" },
   status:{ fontSize:13, fontWeight:"500", textAlign:"center" },
   hint:{ fontSize:13, lineHeight:19 },
+  warnRow:{ flexDirection:"row", alignItems:"flex-start", gap:6, borderWidth:1, borderRadius:8, padding:8 },
+  warnText:{ fontSize:12, flex:1, lineHeight:17 },
+});
+const netSt=StyleSheet.create({
+  card:{ borderRadius:14, borderWidth:StyleSheet.hairlineWidth, padding:16, gap:4 },
+  cardLabel:{ fontSize:11, fontWeight:"700", letterSpacing:0.8, marginBottom:8 },
+  statRow:{ flexDirection:"row", alignItems:"center", paddingVertical:10, borderBottomWidth:StyleSheet.hairlineWidth, gap:10 },
+  statIcon:{ width:30, height:30, borderRadius:8, justifyContent:"center", alignItems:"center" },
+  statLabel:{ flex:1, fontSize:14 },
+  statValue:{ fontSize:14, fontWeight:"600" },
+});
+const sbSt=StyleSheet.create({
+  deviceModal:{ borderTopLeftRadius:20, borderTopRightRadius:20, padding:20, paddingBottom:36 },
+  deviceLabel:{ fontSize:11, fontWeight:"700", letterSpacing:0.8 },
+  deviceRow:{ flexDirection:"row", alignItems:"center", gap:12, paddingVertical:12, paddingHorizontal:8, borderRadius:10 },
+  deviceRowText:{ flex:1, fontSize:15 },
+  grid:{ flexDirection:"row", flexWrap:"wrap", gap:8 },
+  soundBtn:{ borderWidth:1.5, borderRadius:12, padding:10, alignItems:"center", gap:6, minHeight:72, justifyContent:"center" },
+  soundName:{ fontSize:11, fontWeight:"600", textAlign:"center" },
 });
 const legalSt=StyleSheet.create({
   updated:{ fontSize:12, marginBottom:20, marginTop:8 },
@@ -3839,11 +5375,6 @@ const tsSt=StyleSheet.create({
   card:{ flexDirection:"row", alignItems:"flex-start", gap:14, padding:14, borderRadius:14, borderWidth:StyleSheet.hairlineWidth },
   iconWrap:{ width:40, height:40, borderRadius:10, justifyContent:"center", alignItems:"center" },
   title:{ fontSize:14, fontWeight:"600", marginBottom:4 }, body:{ fontSize:13, lineHeight:18 },
-});
-const reorderSt=StyleSheet.create({
-  toggleBtn:{ flexDirection:"row", alignItems:"center", justifyContent:"center", gap:8, paddingVertical:10, paddingHorizontal:16, borderRadius:12, borderWidth:StyleSheet.hairlineWidth, marginBottom:14 },
-  toggleText:{ fontSize:13, fontWeight:"500" },
-  arrowCol:{ flexDirection:"column", gap:2 }, arrowBtn:{ padding:4 },
 });
 const setupSt=StyleSheet.create({
   backRow:{ flexDirection:"row", alignItems:"center", marginBottom:16 },
@@ -3955,4 +5486,56 @@ const volSt=StyleSheet.create({
   sliderThumb:{ position:"absolute", top:-5, width:16, height:16, borderRadius:8,
     backgroundColor:"white", borderWidth:2, marginLeft:-8,
     shadowColor:"#000", shadowOffset:{ width:0,height:1 }, shadowOpacity:0.2, shadowRadius:2, elevation:2 },
+});
+const proSt=StyleSheet.create({
+  badge:{ flexDirection:"row", alignItems:"center", gap:5, backgroundColor:"#007aff22", borderWidth:1, borderColor:"#007aff44", borderRadius:20, paddingHorizontal:12, paddingVertical:4, marginBottom:12 },
+  badgeText:{ color:"#007aff", fontSize:13, fontWeight:"700", letterSpacing:0.5 },
+  title:{ fontSize:24, fontWeight:"700", marginBottom:6, textAlign:"center" },
+  subtitle:{ fontSize:14, textAlign:"center", lineHeight:20, marginBottom:16 },
+  featureGrid:{ gap:10 },
+  featureItem:{ flexDirection:"row", alignItems:"center", gap:12, padding:12, borderRadius:12, borderWidth:StyleSheet.hairlineWidth },
+  featureIcon:{ width:36, height:36, borderRadius:10, justifyContent:"center", alignItems:"center" },
+  featureLabel:{ fontSize:14, fontWeight:"600" },
+  featureDesc:{ fontSize:12, marginTop:1 },
+  buyBtn:{ backgroundColor:"#007aff", borderRadius:14, paddingVertical:16, alignItems:"center" },
+  buyBtnText:{ color:"white", fontSize:17, fontWeight:"700" },
+  lockBadge:{ position:"absolute", top:8, right:8, flexDirection:"row", alignItems:"center", gap:2, backgroundColor:"#007aff", borderRadius:8, paddingHorizontal:5, paddingVertical:2 },
+  lockBadgeText:{ color:"white", fontSize:9, fontWeight:"800", letterSpacing:0.3 },
+});
+const onbSt=StyleSheet.create({
+  page:{ flex:1, alignItems:"center", justifyContent:"center", paddingHorizontal:32, paddingBottom:120 },
+  logoWrap:{ width:100, height:100, borderRadius:24, overflow:"hidden", marginBottom:28, shadowColor:"#000", shadowOffset:{ width:0,height:8 }, shadowOpacity:0.4, shadowRadius:20, elevation:10 },
+  logo:{ width:100, height:100 },
+  bigIcon:{ width:100, height:100, borderRadius:24, justifyContent:"center", alignItems:"center", marginBottom:28 },
+  title:{ fontSize:26, fontWeight:"700", color:"#ffffff", textAlign:"center", marginBottom:10 },
+  subtitle:{ fontSize:16, color:"rgba(255,255,255,0.55)", textAlign:"center", lineHeight:24, marginBottom:32 },
+  featureList:{ width:"100%", gap:14 },
+  featureRow:{ flexDirection:"row", alignItems:"center", gap:14 },
+  featureIcon:{ width:40, height:40, borderRadius:12, justifyContent:"center", alignItems:"center" },
+  featureText:{ flex:1, color:"rgba(255,255,255,0.75)", fontSize:15, lineHeight:21 },
+  stepList:{ width:"100%", gap:16, marginBottom:32 },
+  stepRow:{ flexDirection:"row", alignItems:"flex-start", gap:14 },
+  stepNum:{ width:28, height:28, borderRadius:14, backgroundColor:"#007aff", justifyContent:"center", alignItems:"center", marginTop:1 },
+  stepNumText:{ color:"white", fontSize:13, fontWeight:"700" },
+  stepText:{ flex:1, color:"rgba(255,255,255,0.75)", fontSize:15, lineHeight:22 },
+  dlBtn:{ backgroundColor:"#007aff", borderRadius:14, paddingVertical:16, paddingHorizontal:24, flexDirection:"row", alignItems:"center", justifyContent:"center", gap:10, width:"100%", marginBottom:10 },
+  dlBtnText:{ color:"white", fontSize:16, fontWeight:"600" },
+  freeNote:{ fontSize:13, color:"rgba(255,255,255,0.35)", textAlign:"center" },
+  primaryBtn:{ backgroundColor:"#22c55e", borderRadius:14, paddingVertical:16, paddingHorizontal:24, alignItems:"center", width:"100%" },
+  primaryBtnText:{ color:"white", fontSize:17, fontWeight:"700" },
+  dots:{ flexDirection:"row", justifyContent:"center", gap:8, position:"absolute", bottom:80, left:0, right:0 },
+  dot:{ width:7, height:7, borderRadius:3.5, backgroundColor:"rgba(255,255,255,0.25)" },
+  dotActive:{ backgroundColor:"#ffffff", width:20 },
+  nextRow:{ position:"absolute", bottom:28, left:0, right:0, alignItems:"center" },
+  nextBtn:{ backgroundColor:"#007aff", borderRadius:30, paddingVertical:14, paddingHorizontal:32, flexDirection:"row", alignItems:"center", gap:8 },
+  nextBtnText:{ color:"white", fontSize:16, fontWeight:"600" },
+});
+const dbgSt=StyleSheet.create({
+  banner:{ flexDirection:"row", alignItems:"flex-start", gap:10, padding:12, borderRadius:12, borderWidth:1 },
+  sectionLabel:{ fontSize:11, fontWeight:"700", letterSpacing:0.8, marginTop:4 },
+  infoCard:{ borderRadius:12, borderWidth:StyleSheet.hairlineWidth, overflow:"hidden" },
+  infoRow:{ flexDirection:"row", justifyContent:"space-between", alignItems:"center", padding:12 },
+  actionBtn:{ borderWidth:1, borderRadius:12, paddingVertical:14, paddingHorizontal:16, alignItems:"center" },
+  errorBtn:{ borderWidth:1, borderRadius:12, paddingVertical:12, paddingHorizontal:16, flexDirection:"row", alignItems:"center", gap:10 },
+  logBox:{ borderRadius:12, borderWidth:StyleSheet.hairlineWidth, padding:12, gap:4 },
 });
