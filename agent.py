@@ -138,7 +138,10 @@ def register_code_with_worker(code: str):
         req = urllib.request.Request(
             f"{WORKER_URL}/register",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"PCLink-Agent/{APP_VERSION}",
+            },
             method="POST"
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -549,6 +552,12 @@ def get_now_playing() -> dict | None:
         import asyncio as _asyncio
         import concurrent.futures
         def _run_in_thread():
+            # Initialize COM for this thread to avoid tkinter conflicts
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
             loop = _asyncio.new_event_loop()
             _asyncio.set_event_loop(loop)
             try:
@@ -556,6 +565,11 @@ def get_now_playing() -> dict | None:
             finally:
                 loop.close()
                 _asyncio.set_event_loop(None)
+                try:
+                    import pythoncom
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             result = ex.submit(_run_in_thread).result(timeout=6)
 
@@ -1809,10 +1823,22 @@ async def connect():
         await asyncio.sleep(3)
 
 def run_async():
-    loop = asyncio.new_event_loop()
-    loop_ref["loop"] = loop
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(connect())
+    """Run the async event loop with auto-restart on crash."""
+    while True:
+        try:
+            loop = asyncio.new_event_loop()
+            loop_ref["loop"] = loop
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(connect())
+        except Exception as e:
+            msg = str(e)
+            if "Tcl_AsyncDelete" in msg or "main thread is not in main loop" in msg:
+                print(f"[WARN] Tkinter crash suppressed, restarting async loop...")
+            else:
+                print(f"[ERROR] Async loop crashed: {e}, restarting in 3s...")
+            time.sleep(3)
+            continue
+        break  # clean exit
 
 # ─────────────────────────────────────────────
 # Tray
@@ -2108,9 +2134,7 @@ def show_pair_popup():
     # Expiry + server info
     timer_var = tk.StringVar(value=f"Expires in {PAIR_CODE_TTL}s")
     tk.Label(root, textvariable=timer_var, font=_font(8),
-             bg=UI["bg"], fg=UI["text_muted"]).pack(pady=(6,0))
-    tk.Label(root, text=f"Server: {SERVER_URL}", font=_font(8),
-             bg=UI["bg"], fg=UI["text_muted"]).pack(pady=(2,10))
+             bg=UI["bg"], fg=UI["text_muted"]).pack(pady=(6,10))
 
     remaining = [PAIR_CODE_TTL]
     def tick():
