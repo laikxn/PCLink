@@ -1,6 +1,6 @@
 @echo off
 echo ================================
-echo  PC Control Hub - Agent Builder
+echo  PCLink Agent Builder
 echo ================================
 echo.
 
@@ -14,7 +14,7 @@ if errorlevel 1 (
 
 :: Install/upgrade dependencies
 echo [1/3] Installing dependencies...
-pip install pyinstaller websockets qrcode pillow pystray psutil pycaw pywin32 --quiet
+pip install pyinstaller websockets qrcode pillow pystray psutil pycaw pywin32 pygame winsdk --quiet
 if errorlevel 1 (
     echo [ERROR] Failed to install dependencies
     pause
@@ -23,7 +23,7 @@ if errorlevel 1 (
 
 :: Clean previous build
 echo [2/3] Cleaning previous build...
-if exist dist\PCControlHub-Agent.exe del /f /q dist\PCControlHub-Agent.exe
+if exist "dist\PCLink Agent.exe" del /f /q "dist\PCLink Agent.exe"
 if exist build rmdir /s /q build
 
 :: Build exe
@@ -38,8 +38,8 @@ if errorlevel 1 (
 echo.
 echo ================================
 echo  Build complete!
-echo  Output: dist\PCControlHub-Agent.exe
+echo  Output: dist\PCLink Agent.exe
 echo ================================
 echo.
-echo Upload dist\PCControlHub-Agent.exe to GitHub Releases.
+echo Upload dist\PCLink Agent.exe to GitHub Releases.
 pause
