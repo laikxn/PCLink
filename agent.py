@@ -667,9 +667,31 @@ def run_speedtest() -> dict:
     result = { "download_mbps": None, "upload_mbps": None, "ping_ms": None,
                "server": None, "error": None }
     try:
+        log("[SPEEDTEST] Starting...")
+        import speedtest as _st
+        s = _st.Speedtest()
+        s.get_best_server()
+        log("[SPEEDTEST] Testing download...")
+        s.download()
+        log("[SPEEDTEST] Testing upload...")
+        s.upload()
+        res = s.results.dict()
+        result["download_mbps"] = round(res["download"] / 1_000_000, 2)
+        result["upload_mbps"]   = round(res["upload"]   / 1_000_000, 2)
+        result["ping_ms"]       = round(res["ping"], 1)
+        result["server"]        = res.get("server",{}).get("name","")
+        log(f"[SPEEDTEST] Done: {result['download_mbps']} down, {result['upload_mbps']} up")
+        return result
+    except ImportError:
+        log("[SPEEDTEST] speedtest module not found, trying subprocess...", "warning")
+    except Exception as e:
+        log(f"[SPEEDTEST ERROR] {e}", "error")
+        import traceback; log(traceback.format_exc(), "error")
+        result["error"] = str(e)
+        return result
+    try:
         import subprocess
         CREATE_NO_WINDOW = 0x08000000
-        # Try speedtest-cli first (pip install speedtest-cli)
         r = subprocess.run(
             ["python", "-m", "speedtest", "--json"],
             capture_output=True, text=True, timeout=60,
@@ -683,8 +705,9 @@ def run_speedtest() -> dict:
             result["ping_ms"]       = round(data["ping"], 1)
             result["server"]        = data.get("server",{}).get("name","")
             return result
-    except: pass
-    result["error"] = "Install speedtest-cli: pip install speedtest-cli"
+    except Exception as e:
+        log(f"[SPEEDTEST SUBPROCESS ERROR] {e}", "error")
+    result["error"] = "Speed test unavailable"
     return result
 
 def get_audio_devices() -> dict:
@@ -971,7 +994,8 @@ def get_clipboard() -> str | None:
             result = subprocess.run(["pbpaste"], capture_output=True, text=True)
             return result.stdout
     except Exception as e:
-        print(f"[CLIPBOARD GET ERROR] {e}")
+        log(f"[CLIPBOARD GET ERROR] {e}", "error")
+        import traceback; log(traceback.format_exc(), "error")
     return None
 
 def set_clipboard(text: str) -> bool:
@@ -985,14 +1009,15 @@ def set_clipboard(text: str) -> bool:
                 creationflags=CREATE_NO_WINDOW,
                 capture_output=True
             )
-            print(f"[CLIPBOARD] Set: {text[:50]}")
+            log(f"[CLIPBOARD] Set: {text[:50]}")
             return True
         else:
             import subprocess
             subprocess.run(["pbcopy"], input=text.encode(), check=True)
             return True
     except Exception as e:
-        print(f"[CLIPBOARD SET ERROR] {e}")
+        log(f"[CLIPBOARD SET ERROR] {e}", "error")
+        import traceback; log(traceback.format_exc(), "error")
         return False
 
 # ─────────────────────────────────────────────
@@ -1046,10 +1071,12 @@ def take_screenshot() -> str | None:
         img.save(buf, format="JPEG", quality=75)
         buf.seek(0)
         data = base64.b64encode(buf.read()).decode()
-        print(f"[SCREENSHOT] Captured ({img.width}x{img.height}, {len(data)//1024}KB)")
+        log(f"[SCREENSHOT] Captured ({img.width}x{img.height}, {len(data)//1024}KB)")
         return data
     except Exception as e:
-        print(f"[SCREENSHOT ERROR] {e}")
+        import traceback
+        log(f"[SCREENSHOT ERROR] {e}", "error")
+        log(traceback.format_exc(), "error")
         return None
 
 # ─────────────────────────────────────────────
@@ -1449,7 +1476,7 @@ async def handle_command(cmd, ws):
     t      = cmd.get("type")
     cmd_id = cmd.get("command_id")
     if not t: return
-    print(f"[COMMAND] {t}")
+    log(f"[COMMAND] {t}")
 
     status = "executed"
     try:
@@ -1788,7 +1815,9 @@ async def handle_command(cmd, ws):
             else:
                 flags["show_unpaired"] = True
     except Exception as e:
-        print("[COMMAND ERROR]", e)
+        import traceback
+        log(f"[COMMAND ERROR] {t}: {e}", "error")
+        log(traceback.format_exc(), "error")
         status = "failed"
 
     if cmd_id:

@@ -14,7 +14,7 @@ if errorlevel 1 (
 
 :: Install/upgrade dependencies
 echo [1/3] Installing dependencies...
-pip install pyinstaller websockets qrcode pillow pystray psutil pycaw pywin32 pygame winsdk --quiet
+pip install pyinstaller websockets qrcode pillow pystray psutil pycaw pywin32 pygame winsdk speedtest-cli --quiet
 if errorlevel 1 (
     echo [ERROR] Failed to install dependencies
     pause

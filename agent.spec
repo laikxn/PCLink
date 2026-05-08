@@ -59,8 +59,8 @@ a = Analysis(
         'tkinter',
         'tkinter.filedialog',
         'tkinter.font',
-        # concurrent futures
-        'concurrent.futures',
+        # speedtest
+        'speedtest',
     ],
     excludes=[
         'matplotlib',
