@@ -23,21 +23,61 @@ import threading
 import random
 import signal
 import sys
+import warnings
+from io import BytesIO
+
+# ─────────────────────────────────────────────
+# Logging — set up FIRST before any other imports
+# so log() is available everywhere
+# ─────────────────────────────────────────────
+import logging
+from logging.handlers import RotatingFileHandler
+
+def _get_log_dir() -> str:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.expanduser("~/.config")
+    d = os.path.join(base, "PCLink")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+_LOG_FILE = os.path.join(_get_log_dir(), "agent.log")
+
+def _setup_logging():
+    logger = logging.getLogger("pclink")
+    logger.setLevel(logging.DEBUG)
+    fh = RotatingFileHandler(_LOG_FILE, maxBytes=2*1024*1024, backupCount=2, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(fh)
+    if sys.stdout is not None:
+        try:
+            ch = logging.StreamHandler(sys.stdout)
+            ch.setLevel(logging.DEBUG)
+            ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+            logger.addHandler(ch)
+        except Exception: pass
+    return logger
+
+_log = _setup_logging()
+
+def log(msg:str, level:str="info"):
+    """Log a message to file and console."""
+    getattr(_log, level, _log.info)(msg)
+
 import tkinter as tk
 from tkinter import font as tkfont, filedialog
-import warnings
+import tkinter as _tkinter_mod
 
-# Suppress tkinter garbage-collector threading error (harmless, happens when
-# tkinter StringVar objects are cleaned up from a non-main thread)
-import tkinter
-_orig_del = getattr(tkinter.Variable, '__del__', None)
+# Suppress tkinter garbage-collector threading error
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+_orig_del = getattr(_tkinter_mod.Variable, '__del__', None)
 if _orig_del:
     def _safe_del(self):
         try: _orig_del(self)
         except Exception: pass
-    tkinter.Variable.__del__ = _safe_del
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-from io import BytesIO
+    _tkinter_mod.Variable.__del__ = _safe_del
 
 try:
     import qrcode
@@ -45,34 +85,34 @@ try:
     QR_AVAILABLE = True
 except ImportError:
     QR_AVAILABLE = False
-    print("[WARN] qrcode/pillow not installed. Run: pip install qrcode pillow")
+    log("[WARN] qrcode/pillow not installed. Run: pip install qrcode pillow")
 
 try:
     import pystray
     TRAY_AVAILABLE = True
 except ImportError:
     TRAY_AVAILABLE = False
-    print("[WARN] pystray not installed. Run: pip install pystray")
+    log("[WARN] pystray not installed. Run: pip install pystray")
 
 try:
     import psutil
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
-    print("[WARN] psutil not installed. Run: pip install psutil")
+    log("[WARN] psutil not installed. Run: pip install psutil")
 
 GPU_METHOD = None
 try:
     import GPUtil
     GPU_METHOD = "gputil"
-    print("[GPU] Using GPUtil (Nvidia)")
+    log("[GPU] Using GPUtil (Nvidia)")
 except ImportError:
     try:
         import wmi
         GPU_METHOD = "wmi"
-        print("[GPU] Using WMI (AMD/Intel fallback)")
+        log("[GPU] Using WMI (AMD/Intel fallback)")
     except ImportError:
-        print("[GPU] No GPU library available — GPU stats disabled")
+        log("[GPU] No GPU library available — GPU stats disabled")
 
 PYCAW_AVAILABLE = False
 if os.name == "nt":
@@ -80,9 +120,9 @@ if os.name == "nt":
         from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume, IAudioEndpointVolume
         from comtypes import CLSCTX_ALL
         PYCAW_AVAILABLE = True
-        print("[AUDIO] pycaw available")
+        log("[AUDIO] pycaw available")
     except ImportError:
-        print("[WARN] pycaw not installed. Run: pip install pycaw  (Windows volume mixer disabled)")
+        log("[WARN] pycaw not installed. Run: pip install pycaw  (Windows volume mixer disabled)")
 
 # ─────────────────────────────────────────────
 # App data directory — always use %APPDATA%\PCControlHub
@@ -107,42 +147,6 @@ PAIRED_FILE        = os.path.join(APP_DIR, "paired.json")
 STARTUP_QUEUE_FILE = os.path.join(APP_DIR, "startup_queue.json")
 LOG_FILE           = os.path.join(APP_DIR, "agent.log")
 
-# ─────────────────────────────────────────────
-# Logging — writes to AppData\Roaming\PCLink\agent.log
-# ─────────────────────────────────────────────
-import logging
-from logging.handlers import RotatingFileHandler
-
-def _setup_logging():
-    logger = logging.getLogger("pclink")
-    logger.setLevel(logging.DEBUG)
-    # Rotating log — max 2MB, keep 2 backups
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=2*1024*1024, backupCount=2, encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(fh)
-    # Also print to console if running from terminal
-    if sys.stdout and hasattr(sys.stdout, 'fileno'):
-        try:
-            if os.isatty(sys.stdout.fileno()):
-                ch = logging.StreamHandler(sys.stdout)
-                ch.setLevel(logging.DEBUG)
-                ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-                logger.addHandler(ch)
-        except Exception:
-            pass
-    return logger
-
-_log = _setup_logging()
-
-def log(msg:str, level:str="info"):
-    """Log a message to file and optionally console."""
-    getattr(_log, level, _log.info)(msg)
-    # Also keep existing print behavior (only if stdout available)
-    if sys.stdout is not None:
-        try: print(msg)
-        except Exception: pass
-
 PAIR_CODE_TTL      = 300
 STATS_INTERVAL     = 3
 AUTOSTART_REG_NAME = "PCLinkAgent"
@@ -160,12 +164,12 @@ def check_for_updates():
         latest = data.get("tag_name","").lstrip("v")
         current = APP_VERSION
         if latest and latest != current:
-            print(f"[UPDATE] New version available: v{latest} (current: v{current})")
+            log(f"[UPDATE] New version available: v{latest} (current: v{current})")
             flags["update_available"] = latest
         else:
-            print(f"[UPDATE] Up to date (v{current})")
+            log(f"[UPDATE] Up to date (v{current})")
     except Exception as e:
-        print(f"[UPDATE] Check failed: {e}")
+        log(f"[UPDATE] Check failed: {e}")
 
 def register_code_with_worker(code: str):
     """Register the pairing code + server URL with the Cloudflare Worker lookup service."""
@@ -183,9 +187,9 @@ def register_code_with_worker(code: str):
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             result = json.loads(resp.read())
-            print(f"[WORKER] Code {code} registered (expires in {result.get('expires_in', '?')}s)")
+            log(f"[WORKER] Code {code} registered (expires in {result.get('expires_in', '?')}s)")
     except Exception as e:
-        print(f"[WORKER] Failed to register code: {e}")
+        log(f"[WORKER] Failed to register code: {e}")
 
 # ─────────────────────────────────────────────
 # Config — SERVER_URL stored in config.json,
@@ -206,7 +210,7 @@ def save_config(data: dict):
         with open(CONFIG_FILE, "w") as f:
             json.dump(cfg, f, indent=2)
     except Exception as e:
-        print(f"[CONFIG] Save error: {e}")
+        log(f"[CONFIG] Save error: {e}")
 
 _cfg       = load_config()
 SERVER_URL = "wss://frothier-claire-enterologic.ngrok-free.dev"
@@ -232,9 +236,9 @@ def setup_autostart():
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, AUTOSTART_REG_NAME, 0, winreg.REG_SZ, exe_path)
-        print(f"[AUTOSTART] Registered: {exe_path}")
+        log(f"[AUTOSTART] Registered: {exe_path}")
     except Exception as e:
-        print(f"[AUTOSTART] Failed: {e}")
+        log(f"[AUTOSTART] Failed: {e}")
 
 # ─────────────────────────────────────────────
 # Device identity
@@ -257,7 +261,7 @@ def get_device_mac() -> str:
         mac_bytes = raw.to_bytes(6, "big")
         return ":".join(f"{b:02X}" for b in mac_bytes)
     except Exception as e:
-        print("[MAC ERROR]", e)
+        log("[MAC ERROR]", e)
         return "00:00:00:00:00:00"
 
 DEVICE_ID   = get_device_id()
@@ -317,28 +321,28 @@ def execute_startup_queue():
     steps = load_startup_queue()
     if not steps:
         return
-    print(f"[STARTUP QUEUE] Executing {len(steps)} queued step(s)")
+    log(f"[STARTUP QUEUE] Executing {len(steps)} queued step(s)")
     clear_startup_queue()
 
     # Wait for desktop to be fully loaded and unlocked (max 3 minutes)
-    print("[STARTUP QUEUE] Waiting for desktop to be ready...")
+    log("[STARTUP QUEUE] Waiting for desktop to be ready...")
     for _ in range(180):
         time.sleep(1)
         if not is_session_locked():
             break
     else:
-        print("[STARTUP QUEUE] Timed out waiting for unlock — skipping queue")
+        log("[STARTUP QUEUE] Timed out waiting for unlock — skipping queue")
         return
 
     time.sleep(2)  # Extra buffer after unlock for desktop to settle
-    print("[STARTUP QUEUE] Desktop ready, running steps")
+    log("[STARTUP QUEUE] Desktop ready, running steps")
 
     for step in steps:
         stype = step.get("type")
         if stype == "run_file":
             path = step.get("path", "")
             if path:
-                print(f"[STARTUP QUEUE] Running: {path}")
+                log(f"[STARTUP QUEUE] Running: {path}")
                 run_file(path)
                 time.sleep(1)
         elif stype == "shutdown_pc":
@@ -419,7 +423,7 @@ def get_disk_stats() -> list:
                 "percent":  round(usage.percent, 1),
             })
     except Exception as e:
-        print("[DISK ERROR]", e)
+        log("[DISK ERROR]", e)
     return disks
 
 def collect_stats() -> dict:
@@ -466,23 +470,23 @@ def _run_hidden(cmd: list) -> bool:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception as e:
-        print(f"[CMD ERROR] {e}")
+        log(f"[CMD ERROR] {e}")
         return False
 
 def shutdown_pc() -> bool:
-    print("[ACTION] Shutdown")
+    log("[ACTION] Shutdown")
     return _run_hidden(["shutdown", "/s", "/t", "0", "/f"])
 
 def restart_pc() -> bool:
-    print("[ACTION] Restart")
+    log("[ACTION] Restart")
     return _run_hidden(["shutdown", "/r", "/t", "0", "/f"])
 
 def lock_pc() -> bool:
-    print("[ACTION] Lock")
+    log("[ACTION] Lock")
     return _run_hidden(["rundll32.exe", "user32.dll,LockWorkStation"])
 
 def sleep_pc() -> bool:
-    print("[ACTION] Sleep")
+    log("[ACTION] Sleep")
     if os.name == "nt":
         return _run_hidden(["rundll32.exe", "powrprof.dll,SetSuspendState", "0", "1", "0"])
     return False
@@ -568,7 +572,7 @@ async def _get_now_playing_async():
                     reader.read_bytes(data)
                     album_art_b64 = base64.b64encode(bytes(data)).decode()
         except Exception as e:
-            print(f"[MEDIA ART] {e}")
+            log(f"[MEDIA ART] {e}")
 
         return {
             "title":     title,
@@ -582,68 +586,88 @@ async def _get_now_playing_async():
         log(traceback.format_exc(), "error")
         return None
 
-def get_now_playing() -> dict | None:
-    """Get currently playing media info via PowerShell."""
-    global _last_known_track
-    if os.name != "nt":
-        return None
+def _get_now_playing_powershell() -> dict | None:
+    """Fallback: get now playing via PowerShell (no album art but stable)."""
     try:
         import subprocess, json as _json
         CREATE_NO_WINDOW = 0x08000000
         ps = r"""
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Threading.Tasks;
-using Windows.Media.Control;
-public class MediaHelper {
-    public static string GetNowPlaying() {
-        try {
-            var mgr = GlobalSystemMediaTransportControlsSessionManager.RequestAsync().GetAwaiter().GetResult();
-            var session = mgr.GetCurrentSession();
-            if (session == null) return "{\"title\":\"\",\"artist\":\"\",\"status\":\"\"}";
-            var props = session.TryGetMediaPropertiesAsync().GetAwaiter().GetResult();
-            var playback = session.GetPlaybackInfo();
-            var status = playback != null ? playback.PlaybackStatus.ToString() : "";
-            var title = props?.Title ?? "";
-            var artist = props?.Artist ?? "";
-            return "{\"title\":\"" + title.Replace("\"","\\\"") + "\",\"artist\":\"" + artist.Replace("\"","\\\"") + "\",\"status\":\"" + status + "\",\"album_art\":null}";
-        } catch (Exception ex) {
-            return "{\"title\":\"\",\"artist\":\"\",\"status\":\"\",\"error\":\"" + ex.Message.Replace("\"","\\\"") + "\"}";
-        }
+$ErrorActionPreference = 'SilentlyContinue'
+try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    })[0]
+    [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media,ContentType=WindowsRuntime] | Out-Null
+    $op = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
+    $t = $asTask.MakeGenericMethod([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]).Invoke($null,$op)
+    $t.Wait(3000) | Out-Null
+    $mgr = $t.Result
+    $session = $mgr.GetCurrentSession()
+    if ($null -eq $session) {
+        Write-Output '{"title":"","artist":"","status":""}'
+        exit
     }
+    $op2 = $session.TryGetMediaPropertiesAsync()
+    $t2 = $asTask.MakeGenericMethod([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties]).Invoke($null,$op2)
+    $t2.Wait(3000) | Out-Null
+    $props = $t2.Result
+    $pb = $session.GetPlaybackInfo()
+    $out = @{
+        title = if ($props -and $props.Title) { $props.Title } else { "" }
+        artist = if ($props -and $props.Artist) { $props.Artist } else { "" }
+        status = if ($pb) { $pb.PlaybackStatus.ToString() } else { "" }
+        album_art = $null
+    }
+    Write-Output ($out | ConvertTo-Json -Compress)
+} catch {
+    Write-Output '{"title":"","artist":"","status":""}'
 }
-"@ -Language CSharp -ReferencedAssemblies "System.Runtime.WindowsRuntime","Windows"
-$result = [MediaHelper]::GetNowPlaying()
-Write-Output $result
 """
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
             capture_output=True, text=True, timeout=10,
             creationflags=CREATE_NO_WINDOW
         )
-        output = (r.stdout or "").strip()
-        log(f"[MEDIA PS] rc={r.returncode} out={output[:100]} err={r.stderr[:100] if r.stderr else ''}")
-        if output:
-            for line in output.splitlines():
-                line = line.strip()
-                if line.startswith("{"):
-                    try:
-                        data = _json.loads(line)
-                        if data.get("title"):
-                            _last_known_track = data
-                            log(f"[MEDIA] {data['title']} — {data.get('artist','')} ({data.get('status','')})")
-                            return data
-                    except Exception as e:
-                        log(f"[MEDIA JSON ERROR] {e} — line: {line}", "error")
-        if _last_known_track:
-            return {**_last_known_track, "is_last_known": True}
-        return None
+        for line in (r.stdout or "").strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    data = _json.loads(line)
+                    if data.get("title"):
+                        return data
+                except Exception as e:
+                    log(f"[MEDIA PS JSON] {e} — raw: {line[:80]}", "warning")
     except Exception as e:
-        log(f"[MEDIA ERROR] {e}", "error")
-        if _last_known_track:
-            return {**_last_known_track, "is_last_known": True}
+        log(f"[MEDIA PS ERROR] {e}", "error")
+    return None
+
+def get_now_playing() -> dict | None:
+    """Get currently playing media info including album art via winsdk."""
+    global _last_known_track
+    if os.name != "nt":
         return None
+    try:
+        import asyncio as _asyncio
+        loop = _asyncio.new_event_loop()
+        result = loop.run_until_complete(_get_now_playing_async())
+        loop.close()
+
+        if result and result["title"]:
+            if (result["title"] != _last_known_track.get("title") or
+                result["artist"] != _last_known_track.get("artist")):
+                track = result
+            else:
+                track = {**result, "album_art": None, "art_unchanged": True}
+            _last_known_track = result
+            log(f"[MEDIA] {result['title']} — {result['artist']} ({result['status']})")
+            return track
+
+        if _last_known_track["title"]:
+            return {**_last_known_track, "status": "Paused", "is_last_known": True, "album_art": None}
+    except Exception as e:
+        log(f"[MEDIA INFO ERROR] {e}", "error")
+    return None
 
 def get_network_info() -> dict:
     """Get network adapter stats — connection type and current speeds."""
@@ -681,7 +705,7 @@ def get_network_info() -> dict:
         info["upload_mbps"]   = round((c2.bytes_sent - c1.bytes_sent) * 8 / 1_000_000 / elapsed, 2)
         info["download_mbps"] = round((c2.bytes_recv - c1.bytes_recv) * 8 / 1_000_000 / elapsed, 2)
     except Exception as e:
-        print(f"[NETWORK ERROR] {e}")
+        log(f"[NETWORK ERROR] {e}")
     return info
 
 def run_speedtest() -> dict:
@@ -770,7 +794,7 @@ def get_audio_devices() -> dict:
                 if item.get("Type") == "Playback": devices["outputs"].append(entry)
                 elif item.get("Type") == "Recording": devices["inputs"].append(entry)
     except Exception as e:
-        print(f"[AUDIO DEVICES ERROR] {e}")
+        log(f"[AUDIO DEVICES ERROR] {e}")
     finally:
         try:
             import pythoncom; pythoncom.CoUninitialize()
@@ -791,9 +815,9 @@ def _pygame_worker():
         pygame.mixer.init()
         pygame.mixer.set_num_channels(32)  # support many simultaneous sounds
         _pygame_ready = True
-        print("[SOUND] pygame mixer ready (32 channels)")
+        log("[SOUND] pygame mixer ready (32 channels)")
     except Exception as e:
-        print(f"[SOUND] pygame init failed: {e}")
+        log(f"[SOUND] pygame init failed: {e}")
         _pygame_ready = False
     while True:
         try:
@@ -808,21 +832,21 @@ def _pygame_worker():
                     _active_sounds[:] = [s for s in _active_sounds if s.get_num_channels() > 0]
                     _active_sounds.append(snd)
                     snd.play()
-                    print(f"[SOUND] Playing (overlap ok): {file_path}")
+                    log(f"[SOUND] Playing (overlap ok): {file_path}")
                 except Exception as e:
-                    print(f"[SOUND] Play error: {e}")
+                    log(f"[SOUND] Play error: {e}")
             elif cmd == "stop":
                 try:
                     import pygame
                     pygame.mixer.stop()
                     _active_sounds.clear()
-                    print("[SOUND] Stopped all")
+                    log("[SOUND] Stopped all")
                 except Exception as e:
-                    print(f"[SOUND] Stop error: {e}")
+                    log(f"[SOUND] Stop error: {e}")
         except _queue.Empty:
             continue
         except Exception as e:
-            print(f"[SOUND WORKER] {e}")
+            log(f"[SOUND WORKER] {e}")
 
 def init_pygame_mixer():
     """Start the dedicated pygame worker thread."""
@@ -833,10 +857,10 @@ def play_sound(file_path: str, audio_device_id: int = -1) -> bool:
     """Queue a sound to play — supports overlapping simultaneous playback."""
     try:
         file_path = file_path.replace("/", "\\")
-        print(f"[SOUND DEBUG] path='{file_path}' exists={os.path.exists(file_path)} device={audio_device_id}")
+        log(f"[SOUND DEBUG] path='{file_path}' exists={os.path.exists(file_path)} device={audio_device_id}")
 
         if not os.path.exists(file_path):
-            print(f"[SOUND] File not found: {file_path}")
+            log(f"[SOUND] File not found: {file_path}")
             return False
 
         # Try sounddevice for specific device routing
@@ -845,12 +869,12 @@ def play_sound(file_path: str, audio_device_id: int = -1) -> bool:
                 import sounddevice as sd, soundfile as sf
                 data, samplerate = sf.read(file_path)
                 sd.play(data, samplerate, device=audio_device_id)
-                print(f"[SOUND] Playing via sounddevice on device {audio_device_id}")
+                log(f"[SOUND] Playing via sounddevice on device {audio_device_id}")
                 return True
             except ImportError:
                 pass
             except Exception as e:
-                print(f"[SOUND DEBUG] sounddevice error: {e}")
+                log(f"[SOUND DEBUG] sounddevice error: {e}")
 
         # Queue to dedicated pygame thread
         if _pygame_ready:
@@ -862,13 +886,13 @@ def play_sound(file_path: str, audio_device_id: int = -1) -> bool:
         if ext == ".wav":
             import winsound
             winsound.PlaySound(file_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-            print(f"[SOUND] Playing via winsound")
+            log(f"[SOUND] Playing via winsound")
             return True
 
-        print(f"[SOUND] pygame not ready")
+        log(f"[SOUND] pygame not ready")
         return False
     except Exception as e:
-        print(f"[SOUND ERROR] {e}")
+        log(f"[SOUND ERROR] {e}")
         return False
 
 def stop_all_sounds() -> bool:
@@ -881,13 +905,13 @@ def stop_all_sounds() -> bool:
         winsound.PlaySound(None, winsound.SND_PURGE)
         return True
     except Exception as e:
-        print(f"[STOP ERROR] {e}")
+        log(f"[STOP ERROR] {e}")
         return False
     """Play a sound file through the PC audio output using pygame."""
     try:
         # Normalize path separators — tkinter returns forward slashes on Windows
         file_path = file_path.replace("/", "\\")
-        print(f"[SOUND DEBUG] path='{file_path}' exists={os.path.exists(file_path)} device={device_id}")
+        log(f"[SOUND DEBUG] path='{file_path}' exists={os.path.exists(file_path)} device={device_id}")
 
         # Try sounddevice for specific device routing
         if device_id >= 0:
@@ -896,41 +920,41 @@ def stop_all_sounds() -> bool:
                 data, samplerate = sf.read(file_path)
                 sd.play(data, samplerate, device=device_id)
                 sd.wait()
-                print(f"[SOUND] Played via sounddevice on device {device_id}")
+                log(f"[SOUND] Played via sounddevice on device {device_id}")
                 return True
             except ImportError:
-                print(f"[SOUND DEBUG] sounddevice not available, trying pygame")
+                log(f"[SOUND DEBUG] sounddevice not available, trying pygame")
             except Exception as e:
-                print(f"[SOUND DEBUG] sounddevice error: {e}")
+                log(f"[SOUND DEBUG] sounddevice error: {e}")
 
         # pygame
         try:
             import pygame
-            print(f"[SOUND DEBUG] pygame available, init={pygame.mixer.get_init()}")
+            log(f"[SOUND DEBUG] pygame available, init={pygame.mixer.get_init()}")
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
-                print(f"[SOUND DEBUG] pygame mixer initialized: {pygame.mixer.get_init()}")
+                log(f"[SOUND DEBUG] pygame mixer initialized: {pygame.mixer.get_init()}")
             pygame.mixer.music.load(file_path)
             pygame.mixer.music.play()
-            print(f"[SOUND] Playing via pygame — busy={pygame.mixer.music.get_busy()}")
+            log(f"[SOUND] Playing via pygame — busy={pygame.mixer.music.get_busy()}")
             return True
         except ImportError:
-            print(f"[SOUND DEBUG] pygame not installed")
+            log(f"[SOUND DEBUG] pygame not installed")
         except Exception as e:
-            print(f"[SOUND DEBUG] pygame error: {e}")
+            log(f"[SOUND DEBUG] pygame error: {e}")
 
         # Fallback WAV
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".wav":
             import winsound
             winsound.PlaySound(file_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-            print(f"[SOUND] Playing via winsound")
+            log(f"[SOUND] Playing via winsound")
             return True
 
-        print(f"[SOUND] No method worked for {file_path}")
+        log(f"[SOUND] No method worked for {file_path}")
         return False
     except Exception as e:
-        print(f"[SOUND ERROR] {e}")
+        log(f"[SOUND ERROR] {e}")
         return False
 
 def receive_upload(file_name: str, data_b64: str, dest_folder: str) -> dict:
@@ -946,10 +970,10 @@ def receive_upload(file_name: str, data_b64: str, dest_folder: str) -> dict:
         data = base64.b64decode(data_b64)
         with open(dest_path, "wb") as f:
             f.write(data)
-        print(f"[UPLOAD] Saved: {dest_path} ({len(data)//1024}KB)")
+        log(f"[UPLOAD] Saved: {dest_path} ({len(data)//1024}KB)")
         return {"success": True, "path": dest_path}
     except Exception as e:
-        print(f"[UPLOAD ERROR] {e}")
+        log(f"[UPLOAD ERROR] {e}")
         return {"success": False, "error": str(e)}
 
 def send_media_key(action: str) -> bool:
@@ -973,10 +997,10 @@ def send_media_key(action: str) -> bool:
         KEYEVENTF_KEYUP = 0x0002
         ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
         ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-        print(f"[MEDIA] {action}")
+        log(f"[MEDIA] {action}")
         return True
     except Exception as e:
-        print(f"[MEDIA ERROR] {e}")
+        log(f"[MEDIA ERROR] {e}")
         return False
 
 # ─────────────────────────────────────────────
@@ -1061,10 +1085,10 @@ Add-Type -AssemblyName System.Windows.Forms
             creationflags=CREATE_NO_WINDOW,
             capture_output=True
         )
-        print(f"[TYPE] Typed: {text[:50]}")
+        log(f"[TYPE] Typed: {text[:50]}")
         return True
     except Exception as e:
-        print(f"[TYPE ERROR] {e}")
+        log(f"[TYPE ERROR] {e}")
         return False
 
 # ─────────────────────────────────────────────
@@ -1149,7 +1173,7 @@ def get_volume_sessions() -> list:
             except:
                 pass
     except Exception as e:
-        print(f"[VOLUME] Sessions error: {e}")
+        log(f"[VOLUME] Sessions error: {e}")
     finally:
         try:
             import pythoncom
@@ -1169,7 +1193,7 @@ def get_master_volume() -> dict:
         muted    = bool(endpoint.GetMute())
         return {"volume": volume, "muted": muted}
     except Exception as e:
-        print(f"[VOLUME] Master volume error: {e}")
+        log(f"[VOLUME] Master volume error: {e}")
         return {"volume": 50, "muted": False}
     finally:
         try:
@@ -1212,10 +1236,10 @@ def set_master_volume(volume: float, muted: bool | None = None) -> bool:
         endpoint.SetMasterVolumeLevelScalar(max(0.0, min(1.0, volume / 100)), None)
         if muted is not None:
             endpoint.SetMute(int(muted), None)
-        print(f"[VOLUME] Master set to {volume}%")
+        log(f"[VOLUME] Master set to {volume}%")
         return True
     except Exception as e:
-        print(f"[VOLUME] Set master error: {e}")
+        log(f"[VOLUME] Set master error: {e}")
         return False
     finally:
         try:
@@ -1243,7 +1267,7 @@ def set_session_volume(pid: str, volume: float, muted: bool | None = None) -> bo
                     pass
         return changed
     except Exception as e:
-        print(f"[VOLUME] Set session error: {e}")
+        log(f"[VOLUME] Set session error: {e}")
         return False
     finally:
         try:
@@ -1258,10 +1282,10 @@ def wake_on_lan(mac: str) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             s.sendto(packet, ("255.255.255.255", 9))
-        print("[WOL] Sent")
+        log("[WOL] Sent")
         return True
     except Exception as e:
-        print("[WOL ERROR]", e)
+        log("[WOL ERROR]", e)
         return False
 
 def find_steam_appid_for_path(exe_path: str):
@@ -1298,7 +1322,7 @@ def find_steam_appid_for_path(exe_path: str):
                         return appid_match.group(1)
             except: pass
     except Exception as e:
-        print(f"[STEAM DETECT] Error: {e}")
+        log(f"[STEAM DETECT] Error: {e}")
     return None
 
 def find_epic_appid_for_path(exe_path: str):
@@ -1325,7 +1349,7 @@ def find_epic_appid_for_path(exe_path: str):
                 if app_name:
                     return f"com.epicgames.launcher://apps/{app_name}?action=launch&silent=true"
     except Exception as e:
-        print(f"[EPIC DETECT] Error: {e}")
+        log(f"[EPIC DETECT] Error: {e}")
     return None
 
 def run_file(path: str, run_as_admin: bool = False) -> bool:
@@ -1338,7 +1362,7 @@ def run_file(path: str, run_as_admin: bool = False) -> bool:
     launching via their respective launcher URIs for proper dependency loading.
     Use a .lnk shortcut path for Xbox Game Pass or any other launcher.
     """
-    print(f"[ACTION] Run: {path} (admin={run_as_admin})")
+    log(f"[ACTION] Run: {path} (admin={run_as_admin})")
     try:
         path_lower = path.lower().replace("\\", "/")
 
@@ -1364,17 +1388,17 @@ def run_file(path: str, run_as_admin: bool = False) -> bool:
             appid = find_steam_appid_for_path(path)
             if appid:
                 steam_url = f"steam://rungameid/{appid}"
-                print(f"[ACTION] Steam game — launching via {steam_url}")
+                log(f"[ACTION] Steam game — launching via {steam_url}")
                 os.startfile(steam_url) if os.name == "nt" else __import__("subprocess").Popen(["xdg-open", steam_url])
                 return True
-            print(f"[ACTION] Steam path — App ID not found, trying direct launch")
+            log(f"[ACTION] Steam path — App ID not found, trying direct launch")
 
         # Auto-detect Epic Games
         if os.name == "nt":
             if any(d in path_lower for d in ["epic games","epicgames","fortnite"]):
                 epic_uri = find_epic_appid_for_path(path)
                 if epic_uri:
-                    print(f"[ACTION] Epic game — launching via {epic_uri}")
+                    log(f"[ACTION] Epic game — launching via {epic_uri}")
                     os.startfile(epic_uri)
                     return True
 
@@ -1385,7 +1409,7 @@ def run_file(path: str, run_as_admin: bool = False) -> bool:
                 # ShellExecute with 'runas' triggers UAC elevation prompt
                 ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", path, None, None, 1)
                 if ret <= 32:
-                    print(f"[ACTION] ShellExecute runas failed: {ret}")
+                    log(f"[ACTION] ShellExecute runas failed: {ret}")
                     return False
             else:
                 os.startfile(path)
@@ -1393,7 +1417,7 @@ def run_file(path: str, run_as_admin: bool = False) -> bool:
             import subprocess; subprocess.Popen(["xdg-open", path])
         return True
     except Exception as e:
-        print(f"[RUN FILE ERROR] {e}")
+        log(f"[RUN FILE ERROR] {e}")
         return False
 
 # ─────────────────────────────────────────────
@@ -1429,10 +1453,10 @@ async def send_heartbeat(ws):
     while True:
         try:
             await ws.send(json.dumps({"type": "heartbeat", "device_id": DEVICE_ID, "timestamp": time.time()}))
-            print("[HEARTBEAT] sent")
+            log("[HEARTBEAT] sent")
             await asyncio.sleep(10)
         except Exception as e:
-            print("[HEARTBEAT ERROR]", e); break
+            log("[HEARTBEAT ERROR]", e); break
 
 async def send_stats_loop(ws):
     if PSUTIL_AVAILABLE: psutil.cpu_percent(interval=None)
@@ -1442,7 +1466,7 @@ async def send_stats_loop(ws):
             stats = collect_stats()
             await ws.send(json.dumps({"type": "pc_stats", **stats}))
         except Exception as e:
-            print("[STATS ERROR]", e); break
+            log("[STATS ERROR]", e); break
         await asyncio.sleep(STATS_INTERVAL)
 
 async def send_volume_loop(ws):
@@ -1469,7 +1493,7 @@ async def send_volume_loop(ws):
                     "sessions":  sessions,
                 }))
         except Exception as e:
-            print("[VOLUME LOOP ERROR]", e); break
+            log("[VOLUME LOOP ERROR]", e); break
 
 async def send_network_loop(ws):
     """Poll network stats every second when subscribed."""
@@ -1484,7 +1508,7 @@ async def send_network_loop(ws):
                 "type": "network_info", "device_id": DEVICE_ID, **info
             }))
         except Exception as e:
-            print(f"[NETWORK LOOP ERROR] {e}"); break
+            log(f"[NETWORK LOOP ERROR] {e}"); break
 
 async def handle_command(cmd, ws):
     t      = cmd.get("type")
@@ -1529,14 +1553,14 @@ async def handle_command(cmd, ws):
             }))
             return
         elif t == "get_clipboard":
-            print("[CLIPBOARD] Fetching...")
+            log("[CLIPBOARD] Fetching...")
             loop = asyncio.get_event_loop()
             text = await loop.run_in_executor(None, get_clipboard)
-            print(f"[CLIPBOARD] Got {len(text) if text else 0} chars")
+            log(f"[CLIPBOARD] Got {len(text) if text else 0} chars")
             await ws.send(json.dumps({
                 "type":"clipboard_data","device_id":DEVICE_ID,"text":text or "",
             }))
-            print("[CLIPBOARD] Sent")
+            log("[CLIPBOARD] Sent")
             return
         elif t == "set_clipboard":
             text = cmd.get("text","")
@@ -1589,7 +1613,7 @@ async def handle_command(cmd, ws):
             return
         elif t == "browse_files":
             path = cmd.get("path", "")
-            print(f"[FILES] Browse: '{path}'")
+            log(f"[FILES] Browse: '{path}'")
             try:
                 # Home screen — return common locations instantly
                 if not path:
@@ -1608,7 +1632,7 @@ async def handle_command(cmd, ws):
                         "type":"file_browse_result","device_id":DEVICE_ID,
                         "path":"Home","entries":common,"is_home":True,"done":True,"offset":0,
                     }))
-                    print(f"[FILES] Sent home ({len(common)} items)")
+                    log(f"[FILES] Sent home ({len(common)} items)")
                     return
 
                 dirs  = []
@@ -1635,14 +1659,14 @@ async def handle_command(cmd, ws):
                 dirs.sort(key=lambda e: e["name"].lower())
                 files.sort(key=lambda e: e["name"].lower())
                 all_entries = dirs + files
-                print(f"[FILES] Sending {len(all_entries)} entries for '{path}'")
+                log(f"[FILES] Sending {len(all_entries)} entries for '{path}'")
                 await ws.send(json.dumps({
                     "type":"file_browse_result","device_id":DEVICE_ID,
                     "path":path,"entries":all_entries,"done":True,"offset":0,
                 }))
 
             except Exception as e:
-                print(f"[FILES] Error: {e}")
+                log(f"[FILES] Error: {e}")
                 await ws.send(json.dumps({
                     "type":"file_browse_result","device_id":DEVICE_ID,
                     "path":path,"entries":[],"error":str(e),"done":True,"offset":0,
@@ -1671,9 +1695,9 @@ async def handle_command(cmd, ws):
                     "data":      data,
                     "mime_type": mime,
                 }))
-                print(f"[FILES] Sent: {file_path} ({file_size//1024}KB)")
+                log(f"[FILES] Sent: {file_path} ({file_size//1024}KB)")
             except Exception as e:
-                print(f"[FILES] Error: {e}")
+                log(f"[FILES] Error: {e}")
                 await ws.send(json.dumps({
                     "type":      "file_download_result",
                     "device_id": DEVICE_ID,
@@ -1683,7 +1707,7 @@ async def handle_command(cmd, ws):
             return
         elif t == "search_files":
             query = cmd.get("query", "").lower().strip()
-            print(f"[FILES] Search: '{query}'")
+            log(f"[FILES] Search: '{query}'")
             try:
                 import pathlib
                 results = []
@@ -1712,13 +1736,13 @@ async def handle_command(cmd, ws):
                                 break
                         if len(results) >= 200:
                             break
-                print(f"[FILES] Search found {len(results)} results")
+                log(f"[FILES] Search found {len(results)} results")
                 await ws.send(json.dumps({
                     "type":"search_files_result","device_id":DEVICE_ID,
                     "query":query,"entries":results,
                 }))
             except Exception as e:
-                print(f"[FILES] Search error: {e}")
+                log(f"[FILES] Search error: {e}")
                 await ws.send(json.dumps({
                     "type":"search_files_result","device_id":DEVICE_ID,
                     "query":query,"entries":[],"error":str(e),
@@ -1783,11 +1807,11 @@ async def handle_command(cmd, ws):
             }
             return
             flags["volume_subscribed"] = True
-            print("[VOLUME] Subscribed — polling active")
+            log("[VOLUME] Subscribed — polling active")
             return
         elif t == "volume_unsubscribe":
             flags["volume_subscribed"] = False
-            print("[VOLUME] Unsubscribed — polling paused")
+            log("[VOLUME] Unsubscribed — polling paused")
             return
         elif t == "set_master_volume":
             vol   = cmd.get("volume")
@@ -1813,17 +1837,17 @@ async def handle_command(cmd, ws):
             steps = cmd.get("steps", [])
             if steps:
                 save_startup_queue(steps, wake_triggered=True)
-                print(f"[STARTUP QUEUE] Saved {len(steps)} step(s) for post-wake execution")
+                log(f"[STARTUP QUEUE] Saved {len(steps)} step(s) for post-wake execution")
             return
         elif t == "reload_agent":
             os._exit(0)
         elif t == "pair_confirmed":
             save_paired(True)
-            print("[PAIRED] Saved to paired.json")
+            log("[PAIRED] Saved to paired.json")
             flags["close_popup"] = True
         elif t == "unpaired":
             clear_paired()
-            print("[UNPAIRED] Received from server")
+            log("[UNPAIRED] Received from server")
             if flags["we_initiated_unpair"]:
                 flags["we_initiated_unpair"] = False
             else:
@@ -1853,7 +1877,7 @@ async def connect():
                 additional_headers={"ngrok-skip-browser-warning": "1"},
                 max_size=2*1024*1024*1024) as ws:
                 ws_ref["ws"] = ws
-                print("[CONNECTED]")
+                log("[CONNECTED]")
                 await ws.send(json.dumps({
                     "type": "register", "device_id": DEVICE_ID,
                     "device_name": DEVICE_NAME, "device_mac": DEVICE_MAC, "is_paired": is_paired()
@@ -1862,7 +1886,7 @@ async def connect():
                     await ws.send(json.dumps({
                         "type": "set_pair_code", "device_id": DEVICE_ID, "code": pair_code_ref["code"]
                     }))
-                    print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
+                    log(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
 
                 # Execute startup queue on first connect only
                 if startup_queue_pending and not startup_queue_started:
@@ -1890,26 +1914,29 @@ async def connect():
                         data = json.loads(msg)
                         await handle_command(data, ws)
                     except websockets.ConnectionClosed:
-                        print("[DISCONNECTED] reconnecting...")
+                        log("[DISCONNECTED] reconnecting...")
                         heartbeat_task.cancel(); stats_task.cancel()
                         volume_task.cancel(); network_task.cancel(); break
                     except Exception as e:
-                        print("[RECV ERROR]", e)
+                        log("[RECV ERROR]", e)
         except Exception as e:
-            print("[CONNECTION ERROR]", e)
+            log("[CONNECTION ERROR]", e)
         ws_ref["ws"] = None
         await asyncio.sleep(3)
 
 def run_async():
-    """Run the async event loop once — no auto-restart (add back later if needed)."""
-    try:
-        loop = asyncio.new_event_loop()
-        loop_ref["loop"] = loop
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(connect())
-    except Exception as e:
-        log(f"[ASYNC ERROR] {e}", "error")
-        import traceback; log(traceback.format_exc(), "error")
+    """Run the async event loop with reconnection on network drops."""
+    while not flags.get("tray_quit"):
+        try:
+            loop = asyncio.new_event_loop()
+            loop_ref["loop"] = loop
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(connect())
+        except Exception as e:
+            if flags.get("tray_quit"):
+                break
+            log(f"[ASYNC ERROR] {e} — restarting in 5s", "error")
+            time.sleep(5)
 
 # ─────────────────────────────────────────────
 # Tray
@@ -1979,9 +2006,9 @@ def handle_soundboard_picker_request(request_id: str, file_filter: list):
         )
         root.destroy()
         result = path.replace("/", "\\") if path else None
-        print(f"[SOUNDBOARD PICKER] Selected: {result}")
+        log(f"[SOUNDBOARD PICKER] Selected: {result}")
     except Exception as e:
-        print(f"[SOUNDBOARD PICKER ERROR] {e}"); result = None
+        log(f"[SOUNDBOARD PICKER ERROR] {e}"); result = None
     threadsafe_send({
         "type": "soundboard_file_result",
         "request_id": request_id,
@@ -2011,9 +2038,9 @@ def handle_file_picker_request(request_id: str):
         )
         root.destroy()
         result = path if path else None
-        print(f"[FILE PICKER] Selected: {result}")
+        log(f"[FILE PICKER] Selected: {result}")
     except Exception as e:
-        print(f"[FILE PICKER ERROR] {e}")
+        log(f"[FILE PICKER ERROR] {e}")
         result = None
     threadsafe_send({
         "type":       "file_picker_result",
@@ -2144,12 +2171,12 @@ def _do_unpair_and_notify():
     clear_paired()
     threadsafe_send({"type": "unpair_from_pc", "device_id": DEVICE_ID})
     threadsafe_send({"type": "register", "device_id": DEVICE_ID, "device_name": DEVICE_NAME, "device_mac": DEVICE_MAC, "is_paired": False})
-    print("[AGENT] Unpaired and notified server")
+    log("[AGENT] Unpaired and notified server")
 
 def show_pair_popup():
     close_popup_if_open()
     code = _fresh_code()
-    print(f"[NEW PAIR CODE] {code}")
+    log(f"[NEW PAIR CODE] {code}")
     threadsafe_register_and_code()
     time.sleep(0.4)
 
@@ -2258,7 +2285,7 @@ def handle_unpaired_dialog():
                 kind="info")
             sys.exit(0)
         else:
-            print("[AGENT] Running unpaired in background.")
+            log("[AGENT] Running unpaired in background.")
 
 def handle_tray_unpair():
     if not is_paired():
@@ -2274,7 +2301,7 @@ def handle_tray_unpair():
 
 def handle_tray_restart():
     """Restart the agent process in place."""
-    print("[RESTART] Restarting agent...")
+    log("[RESTART] Restarting agent...")
     try:
         icon = tray_ref.get("icon")
         if icon: icon.stop()
@@ -2361,12 +2388,12 @@ if __name__ == "__main__":
         _fresh_code()
         show_pair_popup()
 
-    print("[AGENT] Running. Right-click the tray icon for options.")
+    log("[AGENT] Running. Right-click the tray icon for options.")
     while True:
         time.sleep(0.4)
         if flags["tray_quit"]:
             flags["tray_quit"] = False
-            print("[EXIT] Quit from tray."); sys.exit(0)
+            log("[EXIT] Quit from tray."); sys.exit(0)
         if flags["tray_restart"]:
             flags["tray_restart"] = False
             handle_tray_restart()
