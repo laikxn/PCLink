@@ -583,59 +583,70 @@ async def _get_now_playing_async():
         return None
 
 def get_now_playing() -> dict | None:
-    """Get currently playing media info. Runs in isolated subprocess to prevent crashes."""
+    """Get currently playing media info via winsdk in an isolated thread."""
     global _last_known_track
     if os.name != "nt":
         return None
     try:
-        import subprocess, json as _json, sys as _sys
-        CREATE_NO_WINDOW = 0x08000000
-        # Run winsdk in a completely separate Python process so crashes can't kill the agent
-        script = """
-import sys, json, asyncio
-async def _get():
-    try:
-        from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
-        from winsdk.windows.storage.streams import DataReader, Buffer, InputStreamOptions
-        import base64
-        manager = await GlobalSystemMediaTransportControlsSessionManager.request_async()
-        session = manager.get_current_session()
-        if not session:
-            print(json.dumps(None)); return
-        props = await session.try_get_media_properties_async()
-        playback = session.get_playback_info()
-        title = props.title or ""
-        artist = props.artist or ""
-        status = str(playback.playback_status).split(".")[-1] if playback else ""
-        album_art_b64 = None
-        try:
-            thumb_ref = props.thumbnail
-            if thumb_ref:
-                stream = await thumb_ref.open_read_async()
-                size = stream.size
-                if size > 0 and size < 500000:
-                    buf = Buffer(int(size))
-                    await stream.read_async(buf, int(size), InputStreamOptions.NONE)
-                    reader = DataReader.from_buffer(buf)
-                    data = bytearray(int(size))
-                    reader.read_bytes(data)
-                    album_art_b64 = base64.b64encode(bytes(data)).decode()
-        except: pass
-        print(json.dumps({"title":title,"artist":artist,"status":status,"album_art":album_art_b64}))
-    except Exception as e:
-        print(json.dumps(None))
-asyncio.run(_get())
-"""
-        result = subprocess.run(
-            [_sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=8,
-            creationflags=CREATE_NO_WINDOW
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            data = _json.loads(result.stdout.strip())
-            if data:
-                _last_known_track = data
-                return data
+        import concurrent.futures
+        import asyncio as _asyncio
+
+        async def _fetch():
+            try:
+                from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+                from winsdk.windows.storage.streams import DataReader, Buffer, InputStreamOptions
+                import base64
+                manager = await GlobalSystemMediaTransportControlsSessionManager.request_async()
+                session = manager.get_current_session()
+                if not session:
+                    return None
+                props    = await session.try_get_media_properties_async()
+                playback = session.get_playback_info()
+                title    = props.title  or ""
+                artist   = props.artist or ""
+                status   = str(playback.playback_status).split(".")[-1] if playback else ""
+                album_art_b64 = None
+                try:
+                    thumb_ref = props.thumbnail
+                    if thumb_ref:
+                        stream = await thumb_ref.open_read_async()
+                        size   = stream.size
+                        if 0 < size < 500_000:
+                            buf    = Buffer(int(size))
+                            await stream.read_async(buf, int(size), InputStreamOptions.NONE)
+                            reader = DataReader.from_buffer(buf)
+                            data   = bytearray(int(size))
+                            reader.read_bytes(data)
+                            album_art_b64 = base64.b64encode(bytes(data)).decode()
+                except Exception: pass
+                return {"title":title,"artist":artist,"status":status,"album_art":album_art_b64}
+            except Exception as e:
+                log(f"[MEDIA WINSDK ERROR] {e}", "error")
+                return None
+
+        def _run():
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+            except Exception: pass
+            loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(_fetch())
+            finally:
+                loop.close()
+                _asyncio.set_event_loop(None)
+                try:
+                    import pythoncom
+                    pythoncom.CoUninitialize()
+                except Exception: pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            result = ex.submit(_run).result(timeout=8)
+
+        if result and result.get("title"):
+            _last_known_track = result
+            return result
         if _last_known_track:
             return {**_last_known_track, "is_last_known": True}
         return None
@@ -1901,33 +1912,15 @@ async def connect():
         await asyncio.sleep(3)
 
 def run_async():
-    """Run the async event loop with auto-restart on crash."""
-    while True:
-        # Check quit flag before restarting
-        if flags.get("tray_quit"):
-            log("[ASYNC] Quit flag set, stopping.")
-            break
-        try:
-            loop = asyncio.new_event_loop()
-            loop_ref["loop"] = loop
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(connect())
-        except Exception as e:
-            msg = str(e)
-            if flags.get("tray_quit"):
-                log("[ASYNC] Quit flag set after exception, stopping.")
-                break
-            if "Tcl_AsyncDelete" in msg or "main thread is not in main loop" in msg:
-                log(f"[WARN] Tkinter crash suppressed, restarting async loop...")
-            else:
-                log(f"[ERROR] Async loop crashed: {e}, restarting in 3s...", "error")
-            time.sleep(3)
-            continue
-        # Clean exit from connect() — check if we should restart or stop
-        if flags.get("tray_quit"):
-            break
-        # connect() returned cleanly without quit — restart
-        time.sleep(1)
+    """Run the async event loop once — no auto-restart (add back later if needed)."""
+    try:
+        loop = asyncio.new_event_loop()
+        loop_ref["loop"] = loop
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(connect())
+    except Exception as e:
+        log(f"[ASYNC ERROR] {e}", "error")
+        import traceback; log(traceback.format_exc(), "error")
 
 # ─────────────────────────────────────────────
 # Tray
@@ -2305,8 +2298,17 @@ def handle_tray_restart():
 # Entry point
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    # Suppress Tcl/tkinter threading errors from background thread cleanup
-    import ctypes
+    # ── Single instance check ──────────────────────────────
+    # Use a Windows mutex to prevent multiple instances
+    _mutex = None
+    if os.name == "nt":
+        try:
+            import ctypes
+            _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "PCLinkAgentMutex")
+            if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+                # Another instance is already running — just exit silently
+                import sys as _sys; _sys.exit(0)
+        except Exception: pass
     original_excepthook = sys.excepthook
     def _safe_excepthook(exc_type, exc_value, exc_tb):
         msg = str(exc_value)
