@@ -583,56 +583,59 @@ async def _get_now_playing_async():
         return None
 
 def get_now_playing() -> dict | None:
-    """Get currently playing media info via PowerShell — no native crashes possible."""
+    """Get currently playing media info via PowerShell."""
     global _last_known_track
     if os.name != "nt":
         return None
     try:
         import subprocess, json as _json
         CREATE_NO_WINDOW = 0x08000000
-        # Use PowerShell to query Windows media session — completely safe, no C crashes
-        ps = """
-try {
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime
-    $null = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media,ContentType=WindowsRuntime]
-    $op = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
-    $wh = New-Object System.Threading.ManualResetEventSlim
-    $op.add_Completed([System.AsyncOperationCompletedHandler[Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]]{
-        param($asyncOp,$status) $script:mgr = $asyncOp.GetResults(); $wh.Set()
-    })
-    $wh.Wait(3000) | Out-Null
-    $session = $mgr.GetCurrentSession()
-    if (-not $session) { Write-Output '{"title":"","artist":"","status":""}'; exit }
-    $propsOp = $session.TryGetMediaPropertiesAsync()
-    $wh2 = New-Object System.Threading.ManualResetEventSlim
-    $propsOp.add_Completed([System.AsyncOperationCompletedHandler[Windows.Media.Control.GlobalSystemMediaTransportControlsSessionInfo]]{
-        param($asyncOp,$status) $script:props = $asyncOp.GetResults(); $wh2.Set()
-    })
-    $wh2.Wait(3000) | Out-Null
-    $playback = $session.GetPlaybackInfo()
-    $status = $playback.PlaybackStatus.ToString()
-    $result = @{ title=$props.Title; artist=$props.Artist; status=$status; album_art=$null }
-    Write-Output (ConvertTo-Json $result -Compress)
-} catch {
-    Write-Output '{"title":"","artist":"","status":"","error":"'+$_.Exception.Message+'"}'
+        ps = r"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using Windows.Media.Control;
+public class MediaHelper {
+    public static string GetNowPlaying() {
+        try {
+            var mgr = GlobalSystemMediaTransportControlsSessionManager.RequestAsync().GetAwaiter().GetResult();
+            var session = mgr.GetCurrentSession();
+            if (session == null) return "{\"title\":\"\",\"artist\":\"\",\"status\":\"\"}";
+            var props = session.TryGetMediaPropertiesAsync().GetAwaiter().GetResult();
+            var playback = session.GetPlaybackInfo();
+            var status = playback != null ? playback.PlaybackStatus.ToString() : "";
+            var title = props?.Title ?? "";
+            var artist = props?.Artist ?? "";
+            return "{\"title\":\"" + title.Replace("\"","\\\"") + "\",\"artist\":\"" + artist.Replace("\"","\\\"") + "\",\"status\":\"" + status + "\",\"album_art\":null}";
+        } catch (Exception ex) {
+            return "{\"title\":\"\",\"artist\":\"\",\"status\":\"\",\"error\":\"" + ex.Message.Replace("\"","\\\"") + "\"}";
+        }
+    }
 }
+"@ -Language CSharp -ReferencedAssemblies "System.Runtime.WindowsRuntime","Windows"
+$result = [MediaHelper]::GetNowPlaying()
+Write-Output $result
 """
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True, timeout=8,
+            capture_output=True, text=True, timeout=10,
             creationflags=CREATE_NO_WINDOW
         )
-        if r.returncode == 0 and r.stdout.strip():
-            # Find the JSON line in output
-            for line in r.stdout.strip().splitlines():
+        output = (r.stdout or "").strip()
+        log(f"[MEDIA PS] rc={r.returncode} out={output[:100]} err={r.stderr[:100] if r.stderr else ''}")
+        if output:
+            for line in output.splitlines():
                 line = line.strip()
                 if line.startswith("{"):
-                    data = _json.loads(line)
-                    if data.get("title"):
-                        _last_known_track = data
-                        log(f"[MEDIA] {data['title']} — {data.get('artist','')} ({data.get('status','')})")
-                        return data
-                    break
+                    try:
+                        data = _json.loads(line)
+                        if data.get("title"):
+                            _last_known_track = data
+                            log(f"[MEDIA] {data['title']} — {data.get('artist','')} ({data.get('status','')})")
+                            return data
+                    except Exception as e:
+                        log(f"[MEDIA JSON ERROR] {e} — line: {line}", "error")
         if _last_known_track:
             return {**_last_known_track, "is_last_known": True}
         return None
