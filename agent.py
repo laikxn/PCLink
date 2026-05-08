@@ -577,7 +577,9 @@ async def _get_now_playing_async():
             "album_art": album_art_b64,
         }
     except Exception as e:
-        print(f"[MEDIA WINSDK ERROR] {e}")
+        import traceback
+        log(f"[MEDIA WINSDK ERROR] {e}", "error")
+        log(traceback.format_exc(), "error")
         return None
 
 def get_now_playing() -> dict | None:

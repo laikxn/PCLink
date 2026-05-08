@@ -2,16 +2,21 @@
 # PyInstaller spec for PCLink Agent
 # Run: pyinstaller agent.spec
 
+from PyInstaller.utils.hooks import collect_all, collect_submodules
+
 block_cipher = None
+
+# Collect ALL winsdk files including .pyd DLLs
+winsdk_datas, winsdk_binaries, winsdk_hiddenimports = collect_all('winsdk')
 
 a = Analysis(
     ['agent.py'],
     pathex=[],
-    binaries=[],
-    datas=[
+    binaries=winsdk_binaries,
+    datas=winsdk_datas + [
         ('icon.ico', '.'),    # Bundle icon for tray use at runtime
     ],
-    hiddenimports=[
+    hiddenimports=winsdk_hiddenimports + [
         # websockets
         'websockets',
         'websockets.legacy',
@@ -50,11 +55,18 @@ a = Analysis(
         # pygame (soundboard)
         'pygame',
         'pygame.mixer',
-        # winsdk (now playing / media controls)
+        # winsdk (now playing / media controls) — include ALL submodules
         'winsdk',
-        'winsdk.windows.media.control',
+        'winsdk.windows',
         'winsdk.windows.media',
+        'winsdk.windows.media.control',
+        'winsdk.windows.media.playback',
         'winsdk.windows.foundation',
+        'winsdk.windows.foundation.collections',
+        'winsdk.windows.storage',
+        'winsdk.windows.storage.streams',
+        'winsdk.windows.system',
+        'winsdk._winrt',
         # tkinter
         'tkinter',
         'tkinter.filedialog',
