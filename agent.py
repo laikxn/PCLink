@@ -105,6 +105,41 @@ CONFIG_FILE        = os.path.join(APP_DIR, "config.json")
 DEVICE_ID_FILE     = os.path.join(APP_DIR, "device_id.txt")
 PAIRED_FILE        = os.path.join(APP_DIR, "paired.json")
 STARTUP_QUEUE_FILE = os.path.join(APP_DIR, "startup_queue.json")
+LOG_FILE           = os.path.join(APP_DIR, "agent.log")
+
+# ─────────────────────────────────────────────
+# Logging — writes to AppData\Roaming\PCLink\agent.log
+# ─────────────────────────────────────────────
+import logging
+from logging.handlers import RotatingFileHandler
+
+def _setup_logging():
+    logger = logging.getLogger("pclink")
+    logger.setLevel(logging.DEBUG)
+    # Rotating log — max 2MB, keep 2 backups
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=2*1024*1024, backupCount=2, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(fh)
+    # Also print to console if running from terminal
+    if sys.stdout and hasattr(sys.stdout, 'fileno'):
+        try:
+            if os.isatty(sys.stdout.fileno()):
+                ch = logging.StreamHandler(sys.stdout)
+                ch.setLevel(logging.DEBUG)
+                ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+                logger.addHandler(ch)
+        except Exception:
+            pass
+    return logger
+
+_log = _setup_logging()
+
+def log(msg:str, level:str="info"):
+    """Log a message to file and optionally console."""
+    getattr(_log, level, _log.info)(msg)
+    # Also keep existing print behavior
+    print(msg)
 
 PAIR_CODE_TTL      = 300
 STATS_INTERVAL     = 3
@@ -2216,8 +2251,11 @@ if __name__ == "__main__":
     def _safe_excepthook(exc_type, exc_value, exc_tb):
         msg = str(exc_value)
         if "Tcl_AsyncDelete" in msg or "main thread is not in main loop" in msg:
-            print(f"[WARN] Suppressed tkinter threading error (harmless): {msg}")
+            log(f"[WARN] Suppressed tkinter threading error (harmless): {msg}")
             return
+        log(f"[CRASH] Unhandled exception: {exc_type.__name__}: {msg}", "error")
+        import traceback
+        log(traceback.format_exc(), "error")
         original_excepthook(exc_type, exc_value, exc_tb)
     sys.excepthook = _safe_excepthook
 
@@ -2227,20 +2265,27 @@ if __name__ == "__main__":
     def _safe_thread_excepthook(args):
         msg = str(args.exc_value)
         if "Tcl_AsyncDelete" in msg or "main thread is not in main loop" in msg:
-            print(f"[WARN] Suppressed tkinter thread error (harmless): {msg}")
+            log(f"[WARN] Suppressed tkinter thread error (harmless): {msg}")
             return
+        log(f"[CRASH] Thread exception in {args.thread.name}: {args.exc_type.__name__}: {msg}", "error")
+        import traceback
+        log("".join(traceback.format_tb(args.exc_traceback)), "error")
         _orig_thread_excepthook(args)
     _threading.excepthook = _safe_thread_excepthook
-    print(f"[AGENT] v{APP_VERSION}")
-    print(f"[AGENT] Device:    {DEVICE_NAME} ({DEVICE_ID})")
-    print(f"[AGENT] MAC:       {DEVICE_MAC}")
-    print(f"[AGENT] Data dir:  {APP_DIR}")
-    print(f"[AGENT] Server:    {SERVER_URL}")
-    print(f"[AGENT] Paired:    {is_paired()}")
-    print(f"[AGENT] psutil:    {PSUTIL_AVAILABLE}")
-    print(f"[AGENT] GPU:       {GPU_METHOD or 'unavailable'}")
+
+    log(f"[AGENT] v{APP_VERSION}")
+    log(f"[AGENT] Device:    {DEVICE_NAME} ({DEVICE_ID})")
+    log(f"[AGENT] MAC:       {DEVICE_MAC}")
+    log(f"[AGENT] Data dir:  {APP_DIR}")
+    log(f"[AGENT] Log file:  {LOG_FILE}")
+    log(f"[AGENT] Server:    {SERVER_URL}")
+    log(f"[AGENT] Paired:    {is_paired()}")
+    log(f"[AGENT] psutil:    {PSUTIL_AVAILABLE}")
+    log(f"[AGENT] GPU:       {GPU_METHOD or 'unavailable'}")
 
     setup_autostart()
+
+    log(f"[AGENT] Starting up — logs at: {LOG_FILE}")
 
     # Pre-initialize pygame for soundboard (eliminates first-play delay)
     threading.Thread(target=init_pygame_mixer, daemon=True).start()
@@ -2249,7 +2294,7 @@ if __name__ == "__main__":
     threading.Thread(target=check_for_updates, daemon=True).start()
 
     def handle_sigint(sig, frame):
-        print("\n[EXIT] Agent stopped."); sys.exit(0)
+        log("[EXIT] Agent stopped."); sys.exit(0)
     signal.signal(signal.SIGINT, handle_sigint)
 
     bg_thread = threading.Thread(target=run_async, daemon=True)
