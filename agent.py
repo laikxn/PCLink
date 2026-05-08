@@ -583,49 +583,67 @@ async def _get_now_playing_async():
         return None
 
 def get_now_playing() -> dict | None:
-    """Get currently playing media info including album art via winsdk."""
+    """Get currently playing media info. Runs in isolated subprocess to prevent crashes."""
     global _last_known_track
     if os.name != "nt":
         return None
     try:
-        import asyncio as _asyncio
-        import concurrent.futures
-        def _run_in_thread():
-            # Initialize COM for this thread to avoid tkinter conflicts
-            try:
-                import pythoncom
-                pythoncom.CoInitialize()
-            except Exception:
-                pass
-            loop = _asyncio.new_event_loop()
-            _asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(_get_now_playing_async())
-            finally:
-                loop.close()
-                _asyncio.set_event_loop(None)
-                try:
-                    import pythoncom
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            result = ex.submit(_run_in_thread).result(timeout=6)
-
-        if result and result["title"]:
-            if (result["title"] != _last_known_track.get("title") or
-                result["artist"] != _last_known_track.get("artist")):
-                track = result
-            else:
-                track = {**result, "album_art": None, "art_unchanged": True}
-            _last_known_track = result
-            print(f"[MEDIA] {result['title']} — {result['artist']} ({result['status']})")
-            return track
-        if _last_known_track["title"]:
-            return {**_last_known_track, "status": "Paused", "is_last_known": True, "album_art": None}
+        import subprocess, json as _json, sys as _sys
+        CREATE_NO_WINDOW = 0x08000000
+        # Run winsdk in a completely separate Python process so crashes can't kill the agent
+        script = """
+import sys, json, asyncio
+async def _get():
+    try:
+        from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+        from winsdk.windows.storage.streams import DataReader, Buffer, InputStreamOptions
+        import base64
+        manager = await GlobalSystemMediaTransportControlsSessionManager.request_async()
+        session = manager.get_current_session()
+        if not session:
+            print(json.dumps(None)); return
+        props = await session.try_get_media_properties_async()
+        playback = session.get_playback_info()
+        title = props.title or ""
+        artist = props.artist or ""
+        status = str(playback.playback_status).split(".")[-1] if playback else ""
+        album_art_b64 = None
+        try:
+            thumb_ref = props.thumbnail
+            if thumb_ref:
+                stream = await thumb_ref.open_read_async()
+                size = stream.size
+                if size > 0 and size < 500000:
+                    buf = Buffer(int(size))
+                    await stream.read_async(buf, int(size), InputStreamOptions.NONE)
+                    reader = DataReader.from_buffer(buf)
+                    data = bytearray(int(size))
+                    reader.read_bytes(data)
+                    album_art_b64 = base64.b64encode(bytes(data)).decode()
+        except: pass
+        print(json.dumps({"title":title,"artist":artist,"status":status,"album_art":album_art_b64}))
     except Exception as e:
-        print(f"[MEDIA INFO ERROR] {e}")
-    return None
+        print(json.dumps(None))
+asyncio.run(_get())
+"""
+        result = subprocess.run(
+            [_sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=8,
+            creationflags=CREATE_NO_WINDOW
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            data = _json.loads(result.stdout.strip())
+            if data:
+                _last_known_track = data
+                return data
+        if _last_known_track:
+            return {**_last_known_track, "is_last_known": True}
+        return None
+    except Exception as e:
+        log(f"[MEDIA ERROR] {e}", "error")
+        if _last_known_track:
+            return {**_last_known_track, "is_last_known": True}
+        return None
 
 def get_network_info() -> dict:
     """Get network adapter stats — connection type and current speeds."""
@@ -1917,7 +1935,13 @@ def run_async():
 def tray_on_pair(icon, item):    flags["show_qr"]     = True
 def tray_on_unpair(icon, item):  flags["tray_unpair"] = True
 def tray_on_restart(icon, item): flags["tray_restart"]= True
-def tray_on_quit(icon, item):    flags["tray_quit"]   = True
+def tray_on_quit(icon, item):
+    flags["tray_quit"] = True
+    log("[EXIT] Quit requested — force exiting.")
+    try: icon.stop()
+    except: pass
+    import os as _os
+    _os.kill(_os.getpid(), 9)
 
 def make_tray_image():
     """Load the PCLink icon for the system tray, fall back to a blue dot."""
