@@ -138,8 +138,10 @@ _log = _setup_logging()
 def log(msg:str, level:str="info"):
     """Log a message to file and optionally console."""
     getattr(_log, level, _log.info)(msg)
-    # Also keep existing print behavior
-    print(msg)
+    # Also keep existing print behavior (only if stdout available)
+    if sys.stdout is not None:
+        try: print(msg)
+        except Exception: pass
 
 PAIR_CODE_TTL      = 300
 STATS_INTERVAL     = 3
@@ -668,47 +670,39 @@ def run_speedtest() -> dict:
                "server": None, "error": None }
     try:
         log("[SPEEDTEST] Starting...")
-        import speedtest as _st
-        s = _st.Speedtest()
-        s.get_best_server()
-        log("[SPEEDTEST] Testing download...")
-        s.download()
-        log("[SPEEDTEST] Testing upload...")
-        s.upload()
-        res = s.results.dict()
-        result["download_mbps"] = round(res["download"] / 1_000_000, 2)
-        result["upload_mbps"]   = round(res["upload"]   / 1_000_000, 2)
-        result["ping_ms"]       = round(res["ping"], 1)
-        result["server"]        = res.get("server",{}).get("name","")
-        log(f"[SPEEDTEST] Done: {result['download_mbps']} down, {result['upload_mbps']} up")
+        # speedtest-cli tries to access sys.stdout.fileno() on import
+        # which fails inside a PyInstaller exe with console=False
+        # Patch it before importing
+        import io
+        _orig_stdout = sys.stdout
+        _orig_stderr = sys.stderr
+        if sys.stdout is None or not hasattr(sys.stdout, 'fileno'):
+            sys.stdout = io.StringIO()
+        if sys.stderr is None or not hasattr(sys.stderr, 'fileno'):
+            sys.stderr = io.StringIO()
+        try:
+            import speedtest as _st
+            s = _st.Speedtest()
+            s.get_best_server()
+            log("[SPEEDTEST] Testing download...")
+            s.download()
+            log("[SPEEDTEST] Testing upload...")
+            s.upload()
+            res = s.results.dict()
+            result["download_mbps"] = round(res["download"] / 1_000_000, 2)
+            result["upload_mbps"]   = round(res["upload"]   / 1_000_000, 2)
+            result["ping_ms"]       = round(res["ping"], 1)
+            result["server"]        = res.get("server",{}).get("name","")
+            log(f"[SPEEDTEST] Done: {result['download_mbps']} down, {result['upload_mbps']} up")
+        finally:
+            sys.stdout = _orig_stdout
+            sys.stderr = _orig_stderr
         return result
-    except ImportError:
-        log("[SPEEDTEST] speedtest module not found, trying subprocess...", "warning")
     except Exception as e:
         log(f"[SPEEDTEST ERROR] {e}", "error")
         import traceback; log(traceback.format_exc(), "error")
-        result["error"] = str(e)
+        result["error"] = "Speed test failed. Please try again."
         return result
-    try:
-        import subprocess
-        CREATE_NO_WINDOW = 0x08000000
-        r = subprocess.run(
-            ["python", "-m", "speedtest", "--json"],
-            capture_output=True, text=True, timeout=60,
-            creationflags=CREATE_NO_WINDOW
-        )
-        if r.returncode == 0:
-            import json as _json
-            data = _json.loads(r.stdout)
-            result["download_mbps"] = round(data["download"] / 1_000_000, 2)
-            result["upload_mbps"]   = round(data["upload"]   / 1_000_000, 2)
-            result["ping_ms"]       = round(data["ping"], 1)
-            result["server"]        = data.get("server",{}).get("name","")
-            return result
-    except Exception as e:
-        log(f"[SPEEDTEST SUBPROCESS ERROR] {e}", "error")
-    result["error"] = "Speed test unavailable"
-    return result
 
 def get_audio_devices() -> dict:
     """Get available audio output and input devices."""
@@ -1889,6 +1883,10 @@ async def connect():
 def run_async():
     """Run the async event loop with auto-restart on crash."""
     while True:
+        # Check quit flag before restarting
+        if flags.get("tray_quit"):
+            log("[ASYNC] Quit flag set, stopping.")
+            break
         try:
             loop = asyncio.new_event_loop()
             loop_ref["loop"] = loop
@@ -1896,13 +1894,20 @@ def run_async():
             loop.run_until_complete(connect())
         except Exception as e:
             msg = str(e)
+            if flags.get("tray_quit"):
+                log("[ASYNC] Quit flag set after exception, stopping.")
+                break
             if "Tcl_AsyncDelete" in msg or "main thread is not in main loop" in msg:
-                print(f"[WARN] Tkinter crash suppressed, restarting async loop...")
+                log(f"[WARN] Tkinter crash suppressed, restarting async loop...")
             else:
-                print(f"[ERROR] Async loop crashed: {e}, restarting in 3s...")
+                log(f"[ERROR] Async loop crashed: {e}, restarting in 3s...", "error")
             time.sleep(3)
             continue
-        break  # clean exit
+        # Clean exit from connect() — check if we should restart or stop
+        if flags.get("tray_quit"):
+            break
+        # connect() returned cleanly without quit — restart
+        time.sleep(1)
 
 # ─────────────────────────────────────────────
 # Tray
