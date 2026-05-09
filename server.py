@@ -514,7 +514,7 @@ async def handler(ws):
 
             elif msg_type in ["clipboard_data", "screenshot_result", "now_playing",
                                "network_info", "speedtest_result", "audio_devices",
-                               "upload_result", "soundboard_file_result"]:
+                               "upload_result", "soundboard_file_result", "wol_info"]:
                 await broadcast_to_mobile(data)
 
             elif msg_type == "wake_pc":

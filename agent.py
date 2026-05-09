@@ -269,6 +269,80 @@ DEVICE_NAME = get_device_name()
 DEVICE_MAC  = get_device_mac()
 
 # ─────────────────────────────────────────────
+# Network identity — local IP, subnet, public IP
+# Collected once at startup and updated on each connect
+# ─────────────────────────────────────────────
+_wol_info: dict = {
+    "local_ip":    None,
+    "subnet_mask": None,
+    "public_ip":   None,
+}
+
+def _collect_local_ip_and_subnet() -> tuple[str|None, str|None]:
+    """Get the primary local IP and subnet mask."""
+    try:
+        if os.name == "nt":
+            import subprocess
+            CREATE_NO_WINDOW = 0x08000000
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike '*Loopback*' -and $_.InterfaceAlias -notlike '*Virtual*' -and $_.PrefixLength -lt 32 } | Sort-Object -Property PrefixLength | Select-Object -First 1 -ExpandProperty IPAddress,PrefixLength | ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=CREATE_NO_WINDOW
+            )
+            # Simpler: use socket to get outbound IP, then get subnet via ipconfig
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            # Get subnet mask via ipconfig for this IP
+            r2 = subprocess.run(
+                ["ipconfig"], capture_output=True, text=True,
+                creationflags=CREATE_NO_WINDOW, timeout=5
+            )
+            subnet = None
+            lines = r2.stdout.splitlines()
+            for i, line in enumerate(lines):
+                if local_ip in line:
+                    # Look ahead for subnet mask
+                    for j in range(i+1, min(i+5, len(lines))):
+                        if "Subnet Mask" in lines[j] or "Subnet" in lines[j]:
+                            parts = lines[j].split(":")
+                            if len(parts) >= 2:
+                                subnet = parts[-1].strip()
+                                break
+                    break
+            return local_ip, subnet
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip, None
+    except Exception as e:
+        log(f"[WOL] Local IP collection error: {e}", "warning")
+        return None, None
+
+def _collect_public_ip() -> str|None:
+    """Fetch public IP from ipify."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:
+            return resp.read().decode().strip()
+    except Exception as e:
+        log(f"[WOL] Public IP fetch error: {e}", "warning")
+        return None
+
+def refresh_wol_info():
+    """Collect and cache local IP, subnet, and public IP. Called on startup and each connect."""
+    local_ip, subnet = _collect_local_ip_and_subnet()
+    public_ip = _collect_public_ip()
+    _wol_info["local_ip"]    = local_ip
+    _wol_info["subnet_mask"] = subnet
+    _wol_info["public_ip"]   = public_ip
+    log(f"[WOL] local={local_ip} subnet={subnet} public={public_ip}")
+
+# ─────────────────────────────────────────────
 # Paired state
 # ─────────────────────────────────────────────
 def is_paired():
@@ -1275,17 +1349,19 @@ def set_session_volume(pid: str, volume: float, muted: bool | None = None) -> bo
             pythoncom.CoUninitialize()
         except: pass
 
-def wake_on_lan(mac: str) -> bool:
+def wake_on_lan(mac: str, ip: str | None = None, port: int = 9) -> bool:
+    """Send WoL magic packet. If ip provided, sends unicast (for away-from-home)."""
     try:
         mac_bytes = bytes.fromhex(mac.replace(":", "").replace("-", ""))
         packet    = b"\xff" * 6 + mac_bytes * 16
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(packet, ("255.255.255.255", 9))
-        log("[WOL] Sent")
+            target = ip if ip else "255.255.255.255"
+            s.sendto(packet, (target, port))
+        log(f"[WOL] Sent to {target}:{port}")
         return True
     except Exception as e:
-        log("[WOL ERROR]", e)
+        log(f"[WOL ERROR] {e}", "error")
         return False
 
 def find_steam_appid_for_path(exe_path: str):
@@ -1454,6 +1530,15 @@ async def send_heartbeat(ws):
         try:
             await ws.send(json.dumps({"type": "heartbeat", "device_id": DEVICE_ID, "timestamp": time.time()}))
             log("[HEARTBEAT] sent")
+            # Piggyback WoL info on every heartbeat so app always has fresh data
+            if _wol_info.get("local_ip"):
+                await ws.send(json.dumps({
+                    "type":        "wol_info",
+                    "device_id":   DEVICE_ID,
+                    "local_ip":    _wol_info.get("local_ip"),
+                    "subnet_mask": _wol_info.get("subnet_mask"),
+                    "public_ip":   _wol_info.get("public_ip"),
+                }))
             await asyncio.sleep(10)
         except Exception as e:
             log("[HEARTBEAT ERROR]", e); break
@@ -1583,9 +1668,11 @@ async def handle_command(cmd, ws):
             }))
             return
         elif t == "wake_pc":
-            mac = cmd.get("mac")
+            mac  = cmd.get("mac")
+            ip   = cmd.get("ip")    # None for LAN broadcast, IP string for unicast
+            port = cmd.get("port", 9)
             if mac:
-                if not wake_on_lan(mac): status = "failed"
+                if not wake_on_lan(mac, ip=ip, port=port): status = "failed"
             else:
                 status = "failed"
         elif t == "run_custom_action":
@@ -1868,6 +1955,9 @@ async def connect():
 
     while True:
         try:
+            # Refresh WoL info (local IP, subnet, public IP) before each connect
+            threading.Thread(target=refresh_wol_info, daemon=True).start()
+
             # Use SSL for wss:// connections (ngrok), plain for ws://
             ssl_ctx = None
             if SERVER_URL.startswith("wss://"):
@@ -1880,7 +1970,10 @@ async def connect():
                 log("[CONNECTED]")
                 await ws.send(json.dumps({
                     "type": "register", "device_id": DEVICE_ID,
-                    "device_name": DEVICE_NAME, "device_mac": DEVICE_MAC, "is_paired": is_paired()
+                    "device_name": DEVICE_NAME, "device_mac": DEVICE_MAC, "is_paired": is_paired(),
+                    "local_ip":    _wol_info.get("local_ip"),
+                    "subnet_mask": _wol_info.get("subnet_mask"),
+                    "public_ip":   _wol_info.get("public_ip"),
                 }))
                 if not is_paired() and pair_code_ref["code"]:
                     await ws.send(json.dumps({
@@ -1892,6 +1985,25 @@ async def connect():
                 if startup_queue_pending and not startup_queue_started:
                     startup_queue_started = True
                     threading.Thread(target=execute_startup_queue, daemon=True).start()
+
+                # Send WoL info once it's collected (may take a second)
+                async def _send_wol_info():
+                    # Wait up to 10s for public IP to be collected
+                    for _ in range(20):
+                        await asyncio.sleep(0.5)
+                        if _wol_info.get("local_ip") and _wol_info.get("public_ip"):
+                            break
+                    try:
+                        await ws.send(json.dumps({
+                            "type":        "wol_info",
+                            "device_id":   DEVICE_ID,
+                            "local_ip":    _wol_info.get("local_ip"),
+                            "subnet_mask": _wol_info.get("subnet_mask"),
+                            "public_ip":   _wol_info.get("public_ip"),
+                        }))
+                        log(f"[WOL] Sent info to app: local={_wol_info.get('local_ip')} public={_wol_info.get('public_ip')}")
+                    except: pass
+                asyncio.create_task(_send_wol_info())
 
                 # Fetch network info once on connect so mobile can show WoL warning
                 async def _send_initial_network():
@@ -2367,6 +2479,9 @@ if __name__ == "__main__":
 
     # Pre-initialize pygame for soundboard (eliminates first-play delay)
     threading.Thread(target=init_pygame_mixer, daemon=True).start()
+
+    # Collect WoL network info in background (local IP, subnet, public IP)
+    threading.Thread(target=refresh_wol_info, daemon=True).start()
 
     # Check for updates in background
     threading.Thread(target=check_for_updates, daemon=True).start()
